@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.pytest_temp/
+*.egg-info/
+
+clab_output/

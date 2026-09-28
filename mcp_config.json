@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "clab-attacker": {
+      "command": "python",
+      "args": [
+        "E:\\netops-ai-agent\\mcp_attacker_server.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

@@ -14,3 +14,17 @@ __pycache__/
 *.egg-info/
 
 clab_output/
+
+# Logs and benchmark test results
+attack_logs/
+**/attack_logs/
+exported_logs/
+scenario_results/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# AI Agent internal files
+.agents/

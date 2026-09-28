@@ -628,6 +628,8 @@ def create_operational_nodes(
                             for r in current_routes:
                                 dest_val = r.get("destination")
                                 if dest_val in ("default", "0.0.0.0/0"):
+                                    if r.get("interface") == "eth0":
+                                        continue
                                     has_route = True
                                     break
                                 try:
@@ -657,6 +659,27 @@ def create_operational_nodes(
                                     )
                         except Exception:
                             pass
+
+        for failure_msg in report_dict.get("failures", []):
+            if "Interface anomaly" in failure_msg:
+                m_if = re.search(r"Interface anomaly:\s*([a-zA-Z0-9_\-]+):([a-zA-Z0-9_\-]+)", failure_msg)
+                if m_if:
+                    if_node = m_if.group(1)
+                    if_name = m_if.group(2)
+                    disc_key = (if_node, "interface_down", if_name)
+                    if disc_key not in seen_discrepancies:
+                        seen_discrepancies.add(disc_key)
+                        if if_node not in suspects:
+                            suspects.append(if_node)
+                        discrepancies.append(
+                            NetworkDiscrepancy(
+                                node=if_node,
+                                discrepancy_type="interface_down",
+                                affected_interface=if_name,
+                                description=f"Interface {if_node}:{if_name} is down",
+                                suspect_nodes=[if_node],
+                            ).model_dump()
+                        )
 
         for s in secondary_suspects:
             if s not in suspects:
@@ -1150,12 +1173,43 @@ def create_operational_nodes(
                 ]
                 remed_plan = llm_provider.generate_structured(messages=rem_messages, response_schema=RemediationPlan)
             except Exception:
-                # Deterministic synthesis from SOP & discrepancy
-                target_subnet = "10.2.2.0/24"
-                for disc in discrepancies:
-                    if disc.get("target_destination"):
-                        target_subnet = disc.get("target_destination")
-                        break
+                target_disc = next((d for d in discrepancies if d.get("node") == target_node), {})
+                if target_disc.get("discrepancy_type") == "interface_down":
+                    target_iface = target_disc.get("affected_interface") or "eth1"
+                    patch_cmd = f"ip link set dev {target_iface} up"
+                    rollback_cmd = f"ip link set dev {target_iface} down"
+                    diag_report = DiagnosticReport(
+                        telemetry_trigger=f"Interface {target_node}:{target_iface} operstate down",
+                        root_cause=f"Network interface {target_iface} on {target_node} is down",
+                        affected_nodes=[target_node],
+                        error_category=ErrorCategory.INTERFACE_DOWN,
+                        severity=SeverityLevel.HIGH,
+                        confidence_score=0.95,
+                        evidence=[f"Interface {target_node}:{target_iface} down", "Retrieved SOP-INTERFACE-002"],
+                    )
+                    remed_plan = RemediationPlan(
+                        action_type=RemediationActionType.EXEC_RUNTIME_COMMAND,
+                        target_entity=target_node,
+                        exec_commands=[patch_cmd],
+                        rollback_steps=[
+                            RollbackStep(
+                                step_order=1,
+                                description=f"Bring down interface {target_iface} on {target_node}",
+                                action="EXEC_COMMAND",
+                                target_node=target_node,
+                                payload=rollback_cmd,
+                            )
+                        ],
+                        expected_outcome=f"Interface {target_iface} on {target_node} restored to UP state",
+                        estimated_risk=SeverityLevel.LOW,
+                    )
+                else:
+                    # Deterministic synthesis from SOP & discrepancy
+                    target_subnet = "10.2.2.0/24"
+                    for disc in discrepancies:
+                        if disc.get("target_destination"):
+                            target_subnet = disc.get("target_destination")
+                            break
 
                 # Derive intelligent next-hop from baseline routes or topology path
                 next_hop = None
@@ -1192,7 +1246,7 @@ def create_operational_nodes(
                     patch_cmd = f"vtysh -c 'configure terminal' -c 'ip route {target_subnet} {next_hop}'"
                     rollback_cmd = f"vtysh -c 'configure terminal' -c 'no ip route {target_subnet} {next_hop}'"
                 else:
-                    patch_cmd = f"ip route add {target_subnet} via {next_hop}"
+                    patch_cmd = f"ip route replace {target_subnet} via {next_hop}"
                     rollback_cmd = f"ip route del {target_subnet} via {next_hop}"
 
                 diag_report = DiagnosticReport(

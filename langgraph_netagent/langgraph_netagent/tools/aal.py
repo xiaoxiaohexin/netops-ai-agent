@@ -33,7 +33,7 @@ class AgentAccessLayer:
         (re.compile(r"\bifconfig\s+\S+\s+(?:0\.0\.0\.0|down\s+delete)\b", re.IGNORECASE), "Interface zeroing is blocked"),
         # Reboot / system shutdown
         (re.compile(r"\b(reboot|poweroff|halt)\b", re.IGNORECASE), "Node reboot / poweroff is blocked"),
-        (re.compile(r"\bshutdown\b(?!\s+-c\b)", re.IGNORECASE), "System shutdown is blocked"),
+        (re.compile(r"(?<!\bno\s)\bshutdown\b(?!\s+-c\b)", re.IGNORECASE), "System shutdown is blocked"),
         (re.compile(r"\b(?:init|telinit)\s+[06]\b", re.IGNORECASE), "System runlevel transition is blocked"),
         (re.compile(r"\bsystemctl\s+(reboot|poweroff|halt|isolate\s+(?:poweroff|reboot|halt)\.target)\b", re.IGNORECASE), "Systemctl power operation is blocked"),
         # Destructive file deletions / disk formatting / wipefs / shred
@@ -116,9 +116,15 @@ class AgentAccessLayer:
         Returns:
             AALResponse with structured parsed JSON and raw outputs.
         """
+        # Strip redundant "docker exec [-flags]* [node_name]" prefix if emitted by LLM
+        clean_command = tool_call.command.strip()
+        m_dock = re.match(r"^docker\s+exec\s+(?:-[a-zA-Z0-9_\-]+\s+)*[a-zA-Z0-9_\-]+\s+(.*)$", clean_command)
+        if m_dock:
+            clean_command = m_dock.group(1).strip()
+
         # 1. Enforce Safety Policy & Read-Only Constraints
         is_safe, error_reason = self.validate_command_safety(
-            command=tool_call.command,
+            command=clean_command,
             read_only=tool_call.read_only,
         )
 
@@ -142,7 +148,7 @@ class AgentAccessLayer:
         try:
             cmd_result: CommandResult = self.lab_adapter.exec_command(
                 node_name=tool_call.node_name,
-                command=tool_call.command,
+                command=clean_command,
                 timeout=tool_call.timeout,
             )
         except Exception as exc:

@@ -29,14 +29,24 @@ Common Fault Categories:
 - config_syntax_error: Invalid configuration preventing daemon startup
 
 Output Format:
-Return a JSON object matching the DiagnosticReport schema. Do NOT include markdown commentary outside the JSON block.
+Return a JSON object strictly matching this schema:
+{
+  "telemetry_trigger": "String describing the failure that triggered diagnosis",
+  "root_cause": "Clear root cause statement",
+  "affected_nodes": ["node1", "node2"],
+  "error_category": "routing_misconfig|interface_down|ip_subnet_mismatch|gateway_unreachable|firewall_filter_drop|arp_resolution_fail|unknown",
+  "severity": "low|medium|high|critical",
+  "confidence_score": 0.95,
+  "evidence": ["cli evidence 1", "cli evidence 2"]
+}
+Do NOT include markdown commentary outside the JSON block.
 """
 
 DAY2_REMEDIATION_SYSTEM_PROMPT = """You are a Day-2 Network Remediation Specialist. Based on a DiagnosticReport, generate an executable RemediationPlan.
 
 Constraints:
-- This is a LIVE network. Changes execute immediately via `docker exec`.
-- Prefer runtime commands (vtysh, sr_cli, ip route) over config file patches for speed.
+- This is a LIVE network. Commands execute directly inside the target node. Do NOT include 'docker exec' or 'ssh' prefixes.
+- Prefer runtime commands (vtysh, sr_cli, ip route, ip link) over config file patches for speed.
 - If config file patches are needed, provide the FULL corrected config content.
 - Always include rollback steps in case verification fails.
 
@@ -44,7 +54,8 @@ Device-Specific Fix Commands:
 - FRR: `vtysh -c 'configure terminal' -c 'ip route <prefix> <nexthop>'`
 - FRR interface: `vtysh -c 'configure terminal' -c 'interface <iface>' -c 'no shutdown'`
 - SRL: `sr_cli 'enter candidate' '/network-instance default static-routes route <prefix> next-hop-group <nhg>' 'commit now'`
-- Linux: `ip route add <prefix> via <gateway> dev <iface>`
+- Linux route: `ip route replace <prefix> via <gateway> dev <iface>`
+- Linux interface: `ip link set dev <iface> up`
 
 Risk Assessment:
 - LOW: Adding a missing route, bringing up an interface
@@ -53,7 +64,24 @@ Risk Assessment:
 - CRITICAL: Restarting daemons or containers
 
 Output Format:
-Return a JSON object matching the RemediationPlan schema. Include exec_commands for immediate fix and rollback_steps for safety.
+Return a JSON object strictly matching this schema:
+{
+  "action_type": "exec_runtime_command",
+  "target_entity": "<target_node_name>",
+  "exec_commands": ["<command_string_1>", "<command_string_2>"],
+  "rollback_steps": [
+    {
+      "step_order": 1,
+      "description": "Revert step 1",
+      "action": "EXEC_COMMAND",
+      "target_node": "<target_node_name>",
+      "payload": "<revert_command_string>"
+    }
+  ],
+  "expected_outcome": "Expected network state after applying fix",
+  "estimated_risk": "low"
+}
+Do NOT nest commands inside objects; `exec_commands` must be an array of strings.
 """
 
 DAY2_HOP_ANALYSIS_PROMPT = """Given the following probe failures and topology path, identify which specific hop(s) are causing the failure.

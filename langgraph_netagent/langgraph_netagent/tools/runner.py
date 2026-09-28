@@ -26,16 +26,15 @@ def strip_wsl_noise(text: str) -> str:
         return ""
     clean_lines = []
     for line in text.splitlines():
-        l_str = line.strip()
-        l_condensed = "".join(l_str.split())
+        l_str = line.replace("\x00", "").strip()
+        l_lower = l_str.lower()
         if (
-            l_str.startswith("wsl:")
-            or l_str.startswith("w s l :")
-            or "localhost" in l_condensed.lower()
-            or ("wsl" in l_condensed.lower() and "nat" in l_condensed.lower())
+            not l_str
+            or "wsl" in l_lower
+            or "localhost" in l_lower
         ):
             continue
-        clean_lines.append(line)
+        clean_lines.append(l_str)
     return "\n".join(clean_lines).strip()
 
 
@@ -179,7 +178,7 @@ class SubprocessRunner:
         return self.run(
             command=docker_cmd,
             timeout=timeout,
-            sudo=False,
+            sudo=self.use_wsl_bridge,
             node_name=node_name or container_name,
         )
 
@@ -257,8 +256,8 @@ class SubprocessRunner:
             timeout=timeout,
             errors="replace",
         )
-        stdout = strip_wsl_noise(strip_ansi_codes(proc.stdout or "").replace("\r\n", "\n"))
-        stderr = strip_wsl_noise(strip_ansi_codes(proc.stderr or "").replace("\r\n", "\n"))
+        stdout = strip_wsl_noise(strip_ansi_codes(proc.stdout or "").replace("\r\n", "\n").replace("\x00", ""))
+        stderr = strip_wsl_noise(strip_ansi_codes(proc.stderr or "").replace("\r\n", "\n").replace("\x00", ""))
         return proc.returncode, stdout, stderr
 
 

@@ -1,0 +1,205 @@
+name: clos5
+mgmt:
+  network: fixedips
+  ipv4-subnet: 172.100.100.0/24
+  ipv6-subnet: 2001:172:100:100::/80
+  mtu: 1500
+
+topology:
+  defaults:
+    kind: linux
+    env:
+      COLLECTOR: sflow-rt
+      SAMPLING: 1000
+      POLLING: 30
+    exec:
+      - touch /tmp/initialized
+  nodes:
+    leaf1:
+      image: sflow/clab-frr
+      group: leaf
+      env:
+        LOCAL_AS: 65001
+        NEIGHBORS: eth1 eth2
+        HOSTPORT: eth3
+        HOSTNET: 172.16.1.1/24
+        HOSTNET6: 2001:172:16:1::1/64
+      exec:
+        - apk add --no-cache dnsmasq
+        - dnsmasq --interface=eth3 --bind-interfaces --dhcp-range=172.16.1.2,172.16.1.50,255.255.255.0,24h --dhcp-host=h1,172.16.1.2 --dhcp-option=3,172.16.1.1 --dhcp-option=121,172.16.0.0/16,172.16.1.1,203.0.113.0/24,172.16.1.1
+    leaf2:
+      image: sflow/clab-frr
+      group: leaf
+      env:
+        LOCAL_AS: 65002
+        NEIGHBORS: eth1 eth2
+        HOSTPORT: eth3
+        HOSTNET: 172.16.2.1/24
+        HOSTNET6: 2001:172:16:2::1/64
+      exec:
+        - apk add --no-cache dnsmasq
+        - dnsmasq --interface=eth3 --bind-interfaces --dhcp-range=172.16.2.2,172.16.2.50,255.255.255.0,24h --dhcp-host=h2,172.16.2.2 --dhcp-option=3,172.16.2.1 --dhcp-option=121,172.16.0.0/16,172.16.2.1,203.0.113.0/24,172.16.2.1
+    leaf3:
+      image: sflow/clab-frr
+      group: leaf
+      env:
+        LOCAL_AS: 65003
+        NEIGHBORS: eth1 eth2
+        HOSTPORT: eth3
+        HOSTNET: 172.16.3.1/24
+        HOSTNET6: 2001:172:16:3::1/64
+      exec:
+        - apk add --no-cache dnsmasq
+        - dnsmasq --interface=eth3 --bind-interfaces --dhcp-range=172.16.3.2,172.16.3.50,255.255.255.0,24h --dhcp-host=h3,172.16.3.2 --dhcp-option=3,172.16.3.1 --dhcp-option=121,172.16.0.0/16,172.16.3.1,203.0.113.0/24,172.16.3.1
+    leaf4:
+      image: sflow/clab-frr
+      group: leaf
+      env:
+        LOCAL_AS: 65004
+        NEIGHBORS: eth1 eth2
+        HOSTPORT: eth3
+        HOSTNET: 172.16.4.1/24
+        HOSTNET6: 2001:172:16:4::1/64
+      exec:
+        - apk add --no-cache dnsmasq
+        - dnsmasq --interface=eth3 --bind-interfaces --dhcp-range=172.16.4.2,172.16.4.50,255.255.255.0,24h --dhcp-host=h4,172.16.4.2 --dhcp-option=3,172.16.4.1 --dhcp-option=121,172.16.0.0/16,172.16.4.1,203.0.113.0/24,172.16.4.1
+    spine1:
+      image: sflow/clab-frr
+      group: spine
+      env:
+        LOCAL_AS: 65005
+        NEIGHBORS: eth1 eth2 eth3
+    spine2:
+      image: sflow/clab-frr
+      group: spine
+      env:
+        LOCAL_AS: 65005
+        NEIGHBORS: eth1 eth2 eth3
+    spine3:
+      image: sflow/clab-frr
+      group: spine
+      env:
+        LOCAL_AS: 65006
+        NEIGHBORS: eth1 eth2 eth3
+    spine4:
+      image: sflow/clab-frr
+      group: spine
+      env:
+        LOCAL_AS: 65006
+        NEIGHBORS: eth1 eth2 eth3
+    superspine1:
+      image: sflow/clab-frr
+      group: superspine
+      env:
+        LOCAL_AS: 65007
+        NEIGHBORS: eth1 eth2
+    superspine2:
+      image: sflow/clab-frr
+      group: superspine
+      env:
+        LOCAL_AS: 65007
+        NEIGHBORS: eth1 eth2
+        HOSTPORT: eth3
+        HOSTNET: 172.16.254.1/24
+        HOSTNET6: 2001:172:16:254::1/64
+    dc-egress:
+      image: ghcr.io/hellt/network-multitool
+      group: egress
+      exec:
+        - touch /tmp/initialized
+        - sysctl -w net.ipv4.ip_forward=1
+        - ip addr add 172.16.254.2/24 dev eth1
+        - ip addr add 203.0.113.1/24 dev eth2
+        - ip addr add 203.0.113.10/32 dev eth2
+        - ip addr add 203.0.113.20/32 dev eth2
+        - ip addr add 203.0.113.30/32 dev eth2
+        - ip addr add 203.0.113.40/32 dev eth2
+        - ip route add 172.16.0.0/16 via 172.16.254.1 dev eth1
+        - iptables -t nat -A PREROUTING -d 203.0.113.10 -j DNAT --to-destination 172.16.1.2
+        - iptables -t nat -A PREROUTING -d 203.0.113.20 -j DNAT --to-destination 172.16.2.2
+        - iptables -t nat -A PREROUTING -d 203.0.113.30 -j DNAT --to-destination 172.16.3.2
+        - iptables -t nat -A PREROUTING -d 203.0.113.40 -j DNAT --to-destination 172.16.4.2
+        - iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
+        - iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE
+    ext-router:
+      image: ghcr.io/hellt/network-multitool
+      group: router
+      exec:
+        - touch /tmp/initialized
+        - sysctl -w net.ipv4.ip_forward=1
+        - ip addr add 203.0.113.2/24 dev eth1
+        - ip addr add 192.168.100.1/24 dev eth2
+        - iptables -t nat -A POSTROUTING -s 192.168.100.0/24 -o eth1 -j MASQUERADE
+        - apk add --no-cache dnsmasq
+        - dnsmasq --interface=eth2 --bind-interfaces --dhcp-range=192.168.100.2,192.168.100.50,255.255.255.0,24h --dhcp-host=attacker,192.168.100.2 --dhcp-option=3,192.168.100.1 --dhcp-option=6,8.8.8.8
+    attacker:
+      image: sflow/clab-iperf3
+      group: attacker
+      exec:
+        - touch /tmp/initialized
+        - udhcpc -i eth1 -x hostname:attacker -q -n
+        - ip route replace default via 192.168.100.1 dev eth1
+    h1:
+      image: sflow/clab-iperf3
+      group: server
+      exec:
+        - udhcpc -i eth1 -x hostname:h1 -q -n
+        - ip route add 172.16.0.0/16 via 172.16.1.1 dev eth1
+        - ip route add 203.0.113.0/24 via 172.16.1.1 dev eth1
+        - apk add --no-cache nginx
+        - mkdir -p /var/www/html
+        - echo '<h1>Clos Fabric - H1 Web Server Online (DHCP Managed)</h1>' > /var/www/html/index.html
+        - echo 'server { listen 80 default_server; root /var/www/html; index index.html; }' > /etc/nginx/http.d/default.conf
+        - nginx
+    h2:
+      image: sflow/clab-iperf3
+      group: server
+      exec:
+        - udhcpc -i eth1 -x hostname:h2 -q -n
+        - ip route add 172.16.0.0/16 via 172.16.2.1 dev eth1
+        - ip route add 203.0.113.0/24 via 172.16.2.1 dev eth1
+    h3:
+      image: sflow/clab-iperf3
+      group: server
+      exec:
+        - udhcpc -i eth1 -x hostname:h3 -q -n
+        - ip route add 172.16.0.0/16 via 172.16.3.1 dev eth1
+        - ip route add 203.0.113.0/24 via 172.16.3.1 dev eth1
+    h4:
+      image: sflow/clab-iperf3
+      group: server
+      exec:
+        - udhcpc -i eth1 -x hostname:h4 -q -n
+        - ip route add 172.16.0.0/16 via 172.16.4.1 dev eth1
+        - ip route add 203.0.113.0/24 via 172.16.4.1 dev eth1
+    sflow-rt:
+      image: sflow/clab-sflow-rt
+      ports:
+        - 8008:8008
+  links:
+    - endpoints: [leaf1:eth1,spine1:eth1]
+    - endpoints: [leaf1:eth2,spine2:eth1]
+    - endpoints: [leaf2:eth1,spine1:eth2]
+    - endpoints: [leaf2:eth2,spine2:eth2]
+    - endpoints: [leaf3:eth1,spine3:eth1]
+    - endpoints: [leaf3:eth2,spine4:eth1]
+    - endpoints: [leaf4:eth1,spine3:eth2]
+    - endpoints: [leaf4:eth2,spine4:eth2]
+    - endpoints: [spine1:eth3,superspine1:eth1]
+    - endpoints: [spine2:eth3,superspine2:eth1]
+    - endpoints: [spine3:eth3,superspine1:eth2]
+    - endpoints: [spine4:eth3,superspine2:eth2] 
+    - endpoints: [superspine2:eth3, dc-egress:eth1]
+      mtu: 9500
+    - endpoints: [dc-egress:eth2, ext-router:eth1]
+      mtu: 1500
+    - endpoints: [attacker:eth1, ext-router:eth2]
+      mtu: 1500
+    - endpoints: [h1:eth1,leaf1:eth3]
+      mtu: 1500
+    - endpoints: [h2:eth1,leaf2:eth3]
+      mtu: 1500
+    - endpoints: [h3:eth1,leaf3:eth3]
+      mtu: 1500
+    - endpoints: [h4:eth1,leaf4:eth3]
+      mtu: 1500

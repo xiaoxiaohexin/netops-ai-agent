@@ -241,7 +241,7 @@ class EnvironmentDetector:
             cmd = [wsl_bin]
             if wsl_distro:
                 cmd.extend(["-d", wsl_distro])
-            cmd.extend(["--", "docker", "info"])
+            cmd.extend(["-u", "root", "--", "docker", "info"])
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=5, errors="replace")
                 if res.returncode == 0:

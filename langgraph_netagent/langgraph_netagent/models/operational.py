@@ -316,8 +316,8 @@ class InventoryPool(BaseModel):
                     if m_ip:
                         ip = m_ip.group(1)
                         prefix_len = int(m_ip.group(2))
-                        # Ignore loopback and mgmt
-                        if not ip.startswith("127.") and not ip.startswith("172."):
+                        # Ignore loopback and mgmt (eth0, 172.100.100.0/24)
+                        if current_iface != "eth0" and not ip.startswith("127.") and not ip.startswith("172.100.100."):
                             ip_to_node[ip] = node_name
                             try:
                                 net = ipaddress.IPv4Network(f"{ip}/{prefix_len}", strict=False)

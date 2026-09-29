@@ -1,113 +1,127 @@
-# Project: NetOps AI Agent — Bounded Autonomy & Decoupled Architecture
+# 项目逻辑梳理（Project Logic）
 
-## Architecture
-The system is an autonomous Network Operations (NetOps / AIOps) incident troubleshooting and closed-loop self-healing agent partitioned into three clean lifecycle phases:
-- **Day-1 (Asset Discovery & Vendor Knowledge Ingestion)**:
-  - Ingests healthy network baseline and extracts IP/asset inventory (`inventory_pool`).
-  - Ingests router vendor documentation (Cisco IOS/XR, Huawei VRP, Linux FRR, Linux host/gateway).
-  - Populates a **Tree-Structured Command Database** (`vendor/platform/domain/action`) storing authoritative command syntax, parameters, and exact rollback templates.
-  - Builds a **Lightweight Vector Index** embedding abstract scene and intent descriptions mapped to tree node paths, enabling hierarchical dual-retrieval with zero prompt bloat (<500B syntax injection).
-- **Day-2 (Cognitive Diagnostic State Machine & Bounded Reasoning)**:
-  - Continuous telemetry monitoring (`--watch`) capturing connectivity, routing, buffer overlimits, and queue drops.
-  - Multi-dimensional anomaly sensing and 5-tuple extraction.
-  - **Two-Stage Diagnostic Decision Loop**:
-    - Stage 1: Read-only context enrichment via AAL (`read_only=True`) and keyword inference. Full autonomy for observation.
-    - Stage 2: Dual-retrieval template consultation and Canonical Intent generation (`DROP_TRAFFIC`, `RATE_LIMIT`, `RESTORE_ROUTE`, etc.) tagged with monotonic `step_tag` and circuit breaker tripping.
-- **Day-3 (Pre-Flight Verification, Bounded Sandbox & Live Deployment)**:
-  - **OpenHands-Inspired Lightweight Docker Sandbox Runtime**: Ephemeral micro-containers with default `--network none` isolation, strict CPU/memory/PIDs resource quotas, automated Garbage Collection (Auto-GC) for orphaned containers and untagged images, and seamless fallback to `MockSandboxRuntime`.
-  - **Canonical Intent Compiler & Rollback Generator**: Compiles abstract intents into platform-specific syntax (Linux iptables, Cisco ACL, Huawei VRP, Linux FRR) and generates mathematically exact inverse rollback compensation commands in reverse topological order.
-  - Pre-flight sandbox trial run producing a certified `PreflightSandboxPassReport`.
-  - **Bounded Autonomy Human-in-the-Loop Gate (HITL)**: Requires verified sandbox pass report before human approval (or `--auto-approve`), completely preventing unverified live modifications.
-  - Live deployment of verified hot-patches, post-change verification probing, and automated rollback execution if verification fails.
-  - **Workflow Harmonization**: Backward-compatible deprecation facades for legacy linear Day-2 nodes (`day2_*`), ensuring 100% test pass rate with zero regression across all 798+ tests.
+> 本文如实描述 `netops-ai-agent` 当前的代码结构与执行链路，替换了此前带营销成分的架构文档。目标是「看清代码现在是什么」，而不是「它想成为什么」。
 
-## Feature Inventory
-| # | Feature | Description | Milestone | Source |
-|---|---------|-------------|-----------|--------|
-| 1 | Ephemeral Docker Sandbox Lifecycle | Isolated container execution with context-manager lifecycle and exit-code/duration capture | M1 | Follow-up R1 |
-| 2 | Network Namespace Isolation (`--network none`) | Complete network isolation preventing packet leakage during pre-flight trial runs | M1 | Follow-up R1 |
-| 3 | Cgroups Resource Quotas | Enforce 1 CPU core (`nano_cpus`), 512MB memory limit, and 100 max PIDs | M1 | Follow-up R1 |
-| 4 | Automated Garbage Collection (Auto-GC) | Sweeper discovering and force-removing orphaned labeled containers (`netops.sandbox=true`) and dangling images | M1 | Follow-up R1 |
-| 5 | Mock Mode Sandbox Fallback | Zero-dependency in-memory virtual node simulation when Docker is absent or `--mode mock` | M1 | Follow-up R1 |
-| 6 | Declarative Canonical Intent Schema | Abstract Pydantic models for `DROP_TRAFFIC`, `RATE_LIMIT`, `REDIRECT_FLOW`, `RESTORE_ROUTE`, `CLEAR_FILTER` | M2 | Follow-up R2 |
-| 7 | Multi-Platform Intent Compiler | Bidirectional compilation targeting Linux `iptables`, Cisco ACL, Huawei VRP, and Linux FRR | M2 | Follow-up R2 |
-| 8 | Mathematical Inverse Rollback Generator | Automatic generation of exact inverse compensation command sequences in reverse topological order | M2 | Follow-up R2 |
-| 9 | AAL Safety Whitelist Integration | Gate all compiled forward and rollback commands through AAL security policies (exit code 126 on violation) | M2 | Follow-up R2 |
-| 10 | Multi-Vendor Documentation Ingestor | Ingestion parser for Cisco, Huawei, Linux FRR command syntax and parameter structures | M3 | Follow-up R3 |
-| 11 | Tree-Structured Command Database | Hierarchical tree storage (`vendor/platform/domain/action`) holding authoritative templates and rollbacks | M3 | Follow-up R3 |
-| 12 | Lightweight Vector Index | In-process embedding/similarity index holding scene/intent descriptions pointing to tree paths | M3 | Follow-up R3 |
-| 13 | Hierarchical Dual-Retrieval Pipeline | Vector query -> tree path resolution -> exact template retrieval, preventing prompt bloat (<500B) | M3 | Follow-up R3 |
-| 14 | Decoupled Two-Stage Diagnostic Loop | Decouple Stage 1 (read-only telemetry & 5-tuple extraction) from Stage 2 (canonical intent plan generation) | M4 | Follow-up R4 |
-| 15 | Strict Read-Only AAL Enforcement in Stage 1 | Block all mutating commands during telemetry observation with AAL `read_only=True` | M4 | Follow-up R4 |
-| 16 | Monotonic Step-Tagging & Circuit Breaker | Explicit iteration tagging (`step_tag`) tripping circuit breaker when `retry_count >= max_retries` | M4 | Follow-up R4 |
-| 17 | Certified Pre-Flight Sandbox Pass Report | Data structure emitting test results, exit codes, and resource stats; gates transition to HITL | M4 | Follow-up R4 |
-| 18 | Human-in-the-Loop (HITL) Gate with Auto-Approve | Guardrailed approval gate requiring certified sandbox pass report before live execution | M4 | Follow-up R4 |
-| 19 | Three-Day Lifecycle Harmonization | Formal separation of Day-1 (Discovery/Ingestion), Day-2 (Diagnosis), Day-3 (Sandbox/Execution) | M5 | Follow-up R5 |
-| 20 | Legacy Day-2 Backward-Compatibility Facades | Non-breaking compatibility wrappers for `day2_nodes.py`, `day2_graph.py` preserving 100% existing tests | M5 | Follow-up R5 |
-| 21 | Zero Regression Across 798+ Test Suite | Complete pass rate across all existing 798 tests + comprehensive new test tiers (T1-T4) | M5 | Follow-up R5 |
+---
 
-## Milestones
-| # | Name | Scope | Dependencies | Status |
-|---|------|-------|-------------|--------|
-| M1 | OpenHands-Inspired Lightweight Docker Sandbox Runtime (Day-3) | `tools/sandbox_runtime.py`, `tools/sandbox.py`, `tools/mock_engine.py`, `models/sandbox.py` | none | DONE |
-| M2 | Canonical Intent Compiler & Rollback Generator (Day-3) | `models/intent.py`, `tools/intent_compiler.py`, `tools/aal.py` | none | DONE |
-| M3 | Vendor Documentation Ingestion & Hierarchical Dual-Retrieval (Day-1) | `models/knowledge.py`, `tools/vendor_knowledge.py`, `tools/sop_retriever.py` | none | DONE |
-| M4 | Bounded AI Autonomy & Two-Stage Diagnostic Decision Loop (Day-2) | `models/operational.py`, `workflow/operational_nodes.py`, `workflow/operational_edges.py`, `workflow/operational_state.py` | M1, M2, M3 | DONE |
-| M5 | Workflow Harmonization & Zero Regression Verification (Day-1/2/3) | `workflow/harmonized_graph.py`, `workflow/day2_nodes.py`, `cli.py`, `tests/` | M4 | DONE |
+## 1. 这是什么
 
-## Interface Contracts
+一个 Python（LangGraph 状态机）编写的**闭环自愈网络运维 Agent 研究原型**。它面向 **Containerlab 容器实验网**（或宿主机网卡），演示：
 
-### 1. Intent Compiler ↔ Sandbox Runtime (M2 ↔ M1)
-- `CanonicalIntent`:
-  - `action: str` (e.g. `"DROP_TRAFFIC"`, `"RATE_LIMIT"`, `"RESTORE_ROUTE"`)
-  - `target_platform: TargetPlatform` (`LINUX_IPTABLES`, `CISCO_IOS`, `HUAWEI_VRP`, `LINUX_FRR`)
-  - `params: Dict[str, Any]` (source_ip, destination_ip, protocol, port, rate_limit_kbps, etc.)
-- `CompilationResult`:
-  - `forward_commands: List[str]`
-  - `rollback_commands: List[str]` (reverse topological order)
-  - `target_platform: TargetPlatform`
-  - `is_safe: bool` (validated against AAL whitelist)
+```
+感知（遥测探针） → 诊断（规则分类） → 有界修复（沙箱预演 + HITL） → 复测 → 回滚 / 熔断
+```
 
-### 2. Dual-Retrieval ↔ Stage 2 Diagnosis (M3 ↔ M4)
-- `DualRetrievalResult`:
-  - `tree_path: str` (e.g. `"linux/iptables/traffic_filtering/drop_forward"`)
-  - `command_template: str` (e.g. `"iptables -I FORWARD -s {src_ip} -d {dst_ip} -p {proto} --dport {dport} -j DROP"`)
-  - `rollback_template: str` (e.g. `"iptables -D FORWARD -s {src_ip} -d {dst_ip} -p {proto} --dport {dport} -j DROP"`)
-  - `parameters: List[str]`
-  - `confidence_score: float`
+核心定位：**验证"有界自治"的工程形态**，而非可交付生产的网管系统。
 
-### 3. Sandbox Validation ↔ HITL Gate (M1/M4)
-- `PreflightSandboxPassReport`:
-  - `sandbox_id: str`
-  - `target_node: str`
-  - `target_platform: TargetPlatform`
-  - `commands_executed: List[str]`
-  - `all_passed: bool`
-  - `exit_codes: List[int]`
-  - `execution_duration_sec: float`
-  - `network_isolated: bool` (must be `True`)
-  - `resource_quotas: Dict[str, Any]` (`cpu_limit="1.0"`, `mem_limit="512m"`, `pids_limit=100`)
-  - `timestamp: str`
-  - `pass_signature: str` (verification hash)
+---
 
-### 4. Legacy Day-2 Compatibility Facade (M5)
-- `run_day2_workflow(...)` and `build_day2_graph(...)`:
-  - Signatures, return types, and state dictionary keys (`status`, `discrepancies`, `candidate_plan`, `dry_run_verified`, `human_approved`, `patch_applied`, `re_verified`) remain 100% backward-compatible.
-  - Emits `DeprecationWarning` advising migration to `HarmonizedOperationalGraph`.
+## 2. 代码库的演进与分层（真实现状）
 
-## Code Layout
-- `langgraph_netagent/models/sandbox.py`: Sandbox execution results, resource quota specs, GC report, pass report models
-- `langgraph_netagent/models/intent.py`: Canonical intent taxonomy, compilation results, rollback steps
-- `langgraph_netagent/models/knowledge.py`: Command tree nodes, vector index entries, dual-retrieval results
-- `langgraph_netagent/tools/sandbox_runtime.py`: OpenHands-inspired Docker sandbox runtime, cgroups quotas, Auto-GC sweeper, MockSandboxRuntime
-- `langgraph_netagent/tools/sandbox.py`: High-level `ShadowSandboxManager` integrating `sandbox_runtime`
-- `langgraph_netagent/tools/intent_compiler.py`: Multi-platform intent compiler (Linux iptables, Cisco ACL, Huawei VRP, Linux FRR) and reverse rollback generator
-- `langgraph_netagent/tools/vendor_knowledge.py`: Vendor doc ingestor, tree database, lightweight vector index, dual-retrieval engine
-- `langgraph_netagent/tools/sop_retriever.py`: Integrates `vendor_knowledge` dual-retrieval with legacy SOP fallback
-- `langgraph_netagent/tools/mock_engine.py`: Mock engine enhancements for sandbox, intent execution, and vendor syntax simulation
-- `langgraph_netagent/workflow/operational_nodes.py`: Bounded autonomy two-stage diagnosis, certified pass report verification, and HITL gate
-- `langgraph_netagent/workflow/operational_state.py`: Augmented state holding canonical intents, pass reports, and knowledge pointers
-- `langgraph_netagent/workflow/day2_nodes.py`: Non-breaking compatibility wrappers for legacy Day-2 nodes
-- `langgraph_netagent/workflow/harmonized_graph.py`: Unified Day-1 / Day-2 / Day-3 operational graph
-- `langgraph_netagent/cli.py`: Integrated CLI options for watch loop, sandbox mode, auto-approve, and harmonized runner
-- `langgraph_netagent/tests/`: Existing 49 test files (798 tests) + dedicated new test suites for M1-M5
+代码是**多轮迭代叠加**的结果，三条工作流并存，而非单一干净架构：
+
+| 工作流 | 文件 | 入口 | 现状 |
+|---|---|---|---|
+| Greenfield（8 节点） | `workflow/graph.py`、`workflow/nodes.py` | `--topo-only` | 最早版本；从零「意图→拓扑→部署→自愈」，CLI 已标注 DEPRECATED |
+| Operational（Day-2） | `workflow/operational_graph.py`、`workflow/operational_nodes.py` | 默认路径 | 当前主用；对**已在运行的网络**做排障自愈 |
+| Harmonized（Day-1/2/3） | `workflow/harmonized_graph.py` | `--harmonized` | 当前主用；统一三阶段，带相位校验 |
+
+CLI 实际分发逻辑（`cli.py`）：
+
+- 默认 → `run_operational_workflow`
+- `--harmonized` → `run_harmonized_workflow`
+- `--topo-only` → 旧 greenfield 导出（弃用）
+- `--day2` → **已定义但未使用**（死标志）
+- `-it` / `--scan` → 独立于工作流，走交互式 / 资产扫描
+
+---
+
+## 3. 真实执行链路（Operational / Harmonized）
+
+以 Operational 工作流为例，逐步说明每步**实际做了什么**：
+
+1. **基线摄取（baseline_ingestion）**：`clab inspect --format json` + `docker exec` 读取运行中节点的 IP/资产清单，构建 `InventoryPool`。
+2. **遥测与五元组提取（telemetry_extraction）**：真实执行 `ping`、`vtysh show ip route`、`tc -s qdisc show`、`ip -s link show`，解析出失败五元组与差异项。
+3. **异常分类（classify_anomaly）**：**纯规则**，四类 —— 外部过载 / 单出口故障 / 内链路故障 / 健康。含大量针对 Clos5 的写死默认值。
+4. **两阶段诊断（diagnostic_stage1 / stage2）**：
+   - Stage 1：经 AAL 只读执行，拉取 running-config / 路由表 / qdisc，推断 RAG 关键词。
+   - Stage 2：检索 SOP 模板，生成 Canonical Intent（如 `DROP_TRAFFIC` / `RESTORE_ROUTE` / `RESET_INTERFACE`），编译为平台命令；LLM 仅用于生成 `DiagnosticReport`/`RemediationPlan` 文案，**失败则走确定性回退**。
+5. **沙箱预演（sandbox_validation）**：`docker commit` 克隆目标节点 → `docker run --network none --privileged` 起隔离副本 → 在副本执行补丁命令 → 清理。mock 模式下改为克隆虚拟节点。
+6. **HITL 审批（human_approval）**：必须有沙箱预演通过报告才允许审批（`--auto-approve` 自动通过，或交互式 `[y/N]`）。
+7. **实弹热补丁（live_hot_patch）**：经 AAL 逐条 `docker exec` 执行补丁命令，带 step_tag。
+8. **复测与回滚（re_verification）**：重新探测；失败则执行逆序回滚命令，重试超限 → 熔断。
+
+---
+
+## 4. 各模块的真实职责
+
+| 模块 | 文件 | 实际职责 |
+|---|---|---|
+| 数据契约 | `models/` | Pydantic 模型（意图、拓扑、诊断、遥测、意图、知识、沙箱报告） |
+| 网络适配 | `tools/clab_adapter.py` | 真实执行 `clab deploy/destroy/inspect` + `docker exec`（Windows 走 WSL2） |
+| 遥测探针 | `tools/probes.py` | ping / 路由表 / 接口 / qdisc 采集与解析 |
+| 访问控制层 | `tools/aal.py` | **正则黑名单** + 只读约束 + CLI 输出归一化 |
+| 沙箱 | `tools/sandbox.py`、`tools/sandbox_runtime.py` | docker commit 克隆 + 试跑 + 清理（含 mock 回退） |
+| 意图编译 | `tools/intent_compiler.py` | 生成 Linux iptables / FRR / Cisco ACL / Huawei VRP **文本命令** + 逆序回滚 |
+| 知识检索 | `tools/sop_retriever.py`、`tools/vendor_knowledge.py` | ~10 条硬编码 SOP + 手工模板树，关键词重叠检索 |
+| 环境探测 | `tools/detector.py`、`tools/nic_adapter.py` | 探测 OS/WSL/Docker/Containerlab；挂载宿主机网卡 |
+| LLM 抽象 | `llm/` | provider 接口；`mock`（罐头）/ `qwen` / `openai` / `vllm` / `ollama` |
+| 工作流 | `workflow/` | 三条工作流的节点 / 边 / 状态 |
+
+---
+
+## 5. 已知局限（诚实清单）
+
+1. **诊断是规则，不是模型**：`classify_anomaly` 为 if/else 硬编码分类，覆盖异常类型很窄（过载 / 缺路由 / 接口 down / ping 丢包）。
+2. **修复模板绑定特定 lab**：代码中大量写死 Clos5 的 IP / 节点名（`192.168.100.2`、`203.0.113.10`、`dc-egress`、`10.1.12.2`、`10.2.2.0/24`），换网络需改代码。
+3. **AAL 是正则黑名单**：可被混淆绕过，非 OS 级安全边界。
+4. **沙箱含 `--privileged`**：有网络隔离（`--network none`），但并非强隔离；「pass 签名」仅为本地哈希，非可信证明。
+5. **无真实设备下发通道**：Cisco / Huawei 只生成文本命令，没有 SSH / NETCONF / gNMI 传输层，无法真正下发到物理设备。
+6. **默认无真实 AI**：`--provider mock` 是罐头回复；真实推理需自行接模型。
+7. **知识库非实时 RAG**：SOP 与厂商模板为手工维护，非文档摄取。
+8. **`--day2` 为死标志**，`--topo-only` 为弃用路径，CLI 存在历史遗留。
+
+---
+
+## 6. 关键数据流
+
+```
+用户意图 / 运行中 lab
+        │
+        ▼
+[baseline_ingestion] ── clab inspect + docker exec ──► InventoryPool / baseline
+        │
+        ▼
+[telemetry_extraction] ── ping/vtysh/tc/ip ──► NetworkHealthReport + FiveTuple + Discrepancy
+        │
+        ▼
+[classify_anomaly] ── 规则 ──► AnomalyClassification
+        │
+        ▼
+[diagnostic_stage1] ── AAL 只读 ──► enriched_context + rag_keywords
+        │
+        ▼
+[diagnostic_stage2] ── SOP 检索 + 意图编译 +（可选）LLM ──► RemediationPlan + rollback_steps
+        │
+        ▼
+[sandbox_validation] ── docker commit 克隆试跑 ──► PreflightSandboxPassReport
+        │
+        ▼
+[human_approval] ── 需通过报告 ──► approved / rejected
+        │
+        ▼
+[live_hot_patch] ── AAL docker exec ──► patch_result
+        │
+        ▼
+[re_verification] ── 复测 ──► re_verified / 回滚 / circuit_breaker
+```
+
+---
+
+## 7. 如果目标是生产网络，还缺什么
+
+- 真实设备接入（SSH / NETCONF / gNMI）与凭证管理
+- 通用拓扑抽象，去掉写死 IP / 节点名
+- 真实 LLM 推理 + 结构化输出强校验 + 人工确认
+- 最小权限沙箱（去 `--privileged`）、命令 allowlist、审计入库
+- 配置基线 / 版本快照、变更窗口、逐设备 diff

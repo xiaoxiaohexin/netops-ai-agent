@@ -101,6 +101,18 @@ class SimpleQAAgent:
         self.aal = AgentAccessLayer(lab_adapter=lab_adapter) if lab_adapter else None
         self.memory = memory or ConversationMemory()
 
+    @property
+    def lab_adapter(self) -> Optional[BaseNetworkLabAdapter]:
+        return self.adapter
+
+    @lab_adapter.setter
+    def lab_adapter(self, adapter: Optional[BaseNetworkLabAdapter]) -> None:
+        self.set_adapter(adapter)
+
+    def set_adapter(self, adapter: Optional[BaseNetworkLabAdapter]) -> None:
+        self.adapter = adapter
+        self.aal = AgentAccessLayer(lab_adapter=adapter) if adapter else None
+
     def _parse_action_block(self, text: str) -> Optional[Dict[str, str]]:
         """Parse ```action ... ``` blocks emitted by the LLM."""
         m = re.search(r"```action\s*\n(.*?)\n```", text, re.DOTALL | re.IGNORECASE)
@@ -231,13 +243,21 @@ class SimpleQAAgent:
         history: Optional[List[ChatMessage]] = None,
     ) -> str:
         """Process user question through Knowledge Retrieval, Day-2 Action Execution, and LLM Generation."""
-        # 1. 实时网络环境拓扑提取
+        # 1. 实时网络环境拓扑提取与环境类型识别
         topo_summary = ""
+        is_nic_network = False
+        adapter_name = ""
         if self.adapter:
             try:
                 topo_summary = self.adapter.get_topology_summary()
             except Exception:
                 pass
+            from langgraph_netagent.tools.nic_adapter import LiveNICAdapter
+            if isinstance(self.adapter, LiveNICAdapter):
+                is_nic_network = True
+                adapter_name = getattr(self.adapter, "interface_name", "Host NIC")
+            else:
+                adapter_name = getattr(self.adapter, "lab_name", "Containerlab")
 
         # 2. 实体工作记忆提取
         memory_ctx = self.memory.format_memory_context()
@@ -257,48 +277,87 @@ class SimpleQAAgent:
                 f"  参考修复: {', '.join(doc.remediation_template[:2])}"
             )
 
-        system_prompt = (
-            "你是一个专业的网络工程与智能运维 AI 助手，精通 Containerlab、FRRouting、BGP、EVPN 及数据中心自动化运维与故障自愈。\n"
-            "用户正在通过 /All 标签与你直接对话。请针对用户提出的任何问题（无范围限制），生成清晰、专业、结构化且直接有用的中文 Markdown 回答。\n"
-        )
+        if is_nic_network:
+            system_prompt = (
+                "你是一个专业的网络工程与智能网络运维 AI 助手，精通企业网、局域网架构、虚拟化网络 (VMware Workstation/ESXi, Hyper-V) 与物理网络运维诊断。\n"
+                "用户正在通过 /All 标签与你直接对话。请针对用户提出的任何问题（无范围限制），生成清晰、专业、结构化且直接有用的中文 Markdown 回答。\n"
+            )
+            if topo_summary:
+                system_prompt += (
+                    f"\n\n【当前接入的真实网卡网络拓扑与在线资产】:\n"
+                    f"{topo_summary}\n\n"
+                    "【回答指引与规则】:\n"
+                    f"1. 你当前已接入宿主机真实物理/虚拟网卡网络: 【{adapter_name}】。\n"
+                    "2. 拓扑中所有节点均为真实扫描发现的在线网络设备（包含宿主机本地网卡、局域网物理/虚拟网关、以及网卡直连通信的物理机或虚拟机，例如 VMware 中运行的 Linux/openEuler 虚拟机）。\n"
+                    "3. 当用户询问当前网络、拓扑结构、节点角色、IP 地址、网段规划、连通性或设备状态时，必须直接依据上述真实资产信息进行详尽、准确、专业的解答，绝对不要套用虚构的 Containerlab 或 CLOS 节点！\n"
+                    "4. 切勿回答'无法确定'、'没有接入环境'等推脱免责辞令。\n"
+                    "5. 如果用户只是咨询概念或拓扑结构等非操作类问题，请直接用专业中文 Markdown 解答，不要输出 action 代码块。\n"
+                )
+            else:
+                system_prompt += (
+                    f"\n\n【回答指引】: 当前已选定网卡接口【{adapter_name}】，但尚未检测到在线邻居端点。请直接以专业、清晰的中文解答用户的网络问题。\n"
+                )
 
-        if topo_summary:
+            if memory_ctx:
+                system_prompt += f"{memory_ctx}\n\n"
+
             system_prompt += (
-                "\n\n【当前运行中的真实网络环境与拓扑底座】:\n"
-                f"{topo_summary}\n\n"
-                "【回答指引与规则】:\n"
-                "1. 你已全面接入上述真实的 Containerlab 运行环境。\n"
-                "2. 当用户询问当前网络、拓扑结构、节点角色、网段规划、BGP 路由互联或运行状态时，必须直接依据上述真实环境信息进行详尽、准确、专业的解答。\n"
-                "3. 切勿回答'无法确定'、'没有接入环境'或'没有拓扑文件'等推脱免责辞令。\n"
-                "4. 如果用户只是咨询概念或拓扑结构等非操作类问题，请直接用专业中文 Markdown 解答，不要输出 action 代码块。\n"
+                "【核心指令规则 - 会话即运维，指令即闭环】:\n"
+                "1. 当用户要求在当前网卡网络执行连通性探测、端口扫描或诊断时，可以输出 action 代码块调用底层工具执行：\n"
+                "   - 节点连通性测试: `Test-Connection -ComputerName <目标IP> -Count 2`\n"
+                "   - 端口扫描验证 (如目标虚机 SSH 端口): `Test-NetConnection -ComputerName <目标IP> -Port 22`\n"
+                "   - ARP 状态与网段排查: `Get-NetNeighbor -InterfaceAlias '<网卡名>'`\n"
+                "2. 输出 action 代码块格式规范：\n"
+                "```action\n"
+                "node: <目标节点名或IP, 例如 192.168.245.139>\n"
+                "command: <在主机网络中执行的诊断测试命令>\n"
+                "verify: <可选, 验证结果的命令>\n"
+                "description: <操作简述>\n"
+                "```\n"
             )
         else:
-            system_prompt += (
-                "\n\n【回答指引】: 当前尚未检测到运行拓扑。请直接以专业、清晰的中文解答用户的通用网络技术、协议设计或方案问题。\n"
+            system_prompt = (
+                "你是一个专业的网络工程与智能运维 AI 助手，精通 Containerlab、FRRouting、BGP、EVPN 及数据中心自动化运维与故障自愈。\n"
+                "用户正在通过 /All 标签与你直接对话。请针对用户提出的任何问题（无范围限制），生成清晰、专业、结构化且直接有用的中文 Markdown 回答。\n"
             )
 
-        if memory_ctx:
-            system_prompt += f"{memory_ctx}\n\n"
+            if topo_summary:
+                system_prompt += (
+                    "\n\n【当前运行中的真实网络环境与拓扑底座】:\n"
+                    f"{topo_summary}\n\n"
+                    "【回答指引与规则】:\n"
+                    "1. 你已全面接入上述真实的 Containerlab 运行环境。\n"
+                    "2. 当用户询问当前网络、拓扑结构、节点角色、网段规划、BGP 路由互联或运行状态时，必须直接依据上述真实环境信息进行详尽、准确、专业的解答。\n"
+                    "3. 切勿回答'无法确定'、'没有接入环境'或'没有拓扑文件'等推脱免责辞令。\n"
+                    "4. 如果用户只是咨询概念或拓扑结构等非操作类问题，请直接用专业中文 Markdown 解答，不要输出 action 代码块。\n"
+                )
+            else:
+                system_prompt += (
+                    "\n\n【回答指引】: 当前尚未检测到运行拓扑。请直接以专业、清晰的中文解答用户的通用网络技术、协议设计或方案问题。\n"
+                )
 
-        system_prompt += (
-            "【核心指令规则 - 会话即运维，指令即闭环】:\n"
-            "1. 当用户要求在容器内执行运维操作（例如：安装服务、启动程序、配置路由、测试连通性、停止服务等），必须输出 action 代码块调用底层工具执行，严禁只输出让用户手动操作的教程文本！\n"
-            "2. 主机节点环境特性 (h1, h2, h3, h4):\n"
-            "   - 镜像基于精简 Alpine Linux，已预装 python3，没有 systemctl 或 busybox httpd。\n"
-            "   - 启动轻量 Web 服务建议直接使用: `sh -c 'mkdir -p /var/www/html && echo \"<h1>Hello from h1</h1>\" > /var/www/html/index.html && nohup python3 -m http.server 8080 --directory /var/www/html >/tmp/http.log 2>&1 & sleep 0.5'`\n"
-            "   - 停止服务建议使用: `pkill -9 -f 'python3 -m http.server'`\n"
-            "   - 本地状态验证: `(ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep 8080`\n"
-            "   - 跨节点探针验证: 在 probe_from 节点 (如 h2/h3) 使用 `wget -qO- -T 3 http://172.16.1.2:8080`\n"
-            "3. 输出 action 代码块格式规范：\n"
-            "```action\n"
-            "node: <目标节点名, 例如 h1, leaf1, h2>\n"
-            "command: <在容器内执行的具体命令>\n"
-            "verify: <在目标容器中验证生效的本地探针命令>\n"
-            "probe_from: <可选, 跨节点发起端对端验证的源节点, 例如 h2>\n"
-            "probe_command: <可选, 在 probe_from 节点执行的验证命令, 例如 wget -qO- -T 3 http://172.16.1.2:8080>\n"
-            "description: <操作简述>\n"
-            "```\n"
-        )
+            if memory_ctx:
+                system_prompt += f"{memory_ctx}\n\n"
+
+            system_prompt += (
+                "【核心指令规则 - 会话即运维，指令即闭环】:\n"
+                "1. 当用户要求在容器内执行运维操作（例如：安装服务、启动程序、配置路由、测试连通性、停止服务等），必须输出 action 代码块调用底层工具执行，严禁只输出让用户手动操作的教程文本！\n"
+                "2. 主机节点环境特性 (h1, h2, h3, h4):\n"
+                "   - 镜像基于精简 Alpine Linux，已预装 python3，没有 systemctl 或 busybox httpd。\n"
+                "   - 启动轻量 Web 服务建议直接使用: `sh -c 'mkdir -p /var/www/html && echo \"<h1>Hello from h1</h1>\" > /var/www/html/index.html && nohup python3 -m http.server 8080 --directory /var/www/html >/tmp/http.log 2>&1 & sleep 0.5'`\n"
+                "   - 停止服务建议使用: `pkill -9 -f 'python3 -m http.server'`\n"
+                "   - 本地状态验证: `(ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep 8080`\n"
+                "   - 跨节点探针验证: 在 probe_from 节点 (如 h2/h3) 使用 `wget -qO- -T 3 http://172.16.1.2:8080`\n"
+                "3. 输出 action 代码块格式规范：\n"
+                "```action\n"
+                "node: <目标节点名, 例如 h1, leaf1, h2>\n"
+                "command: <在容器内执行的具体命令>\n"
+                "verify: <在目标容器中验证生效的本地探针命令>\n"
+                "probe_from: <可选, 跨节点发起端对端验证的源节点, 例如 h2>\n"
+                "probe_command: <可选, 在 probe_from 节点执行的验证命令, 例如 wget -qO- -T 3 http://172.16.1.2:8080>\n"
+                "description: <操作简述>\n"
+                "```\n"
+            )
 
         if context_blocks:
             system_prompt += "\n\n【参考知识库检索结果】:\n" + "\n".join(context_blocks)
@@ -316,6 +375,17 @@ class SimpleQAAgent:
             raw_resp = self.llm.chat(messages, json_mode=False)
         except Exception as exc:
             return f"AI 回答生成异常: {exc}"
+
+        if not raw_resp or raw_resp.strip() in ("", "{}"):
+            if topo_summary:
+                raw_resp = (
+                    f"### 🌐 当前网络拓扑与资产概览 (离线响应)\n\n"
+                    f"{topo_summary}\n\n"
+                    f"- **拓扑说明**: Agent 已识别并绑定当前网络环境，包含上述在线端点与网段互联。\n"
+                    f"- **运维提示**: 可在控制台使用 `probe` 测试连通性或使用 `routes` 查看路由表。"
+                )
+            else:
+                raw_resp = "已收到您的网络运维咨询。当前处于离线 Mock 模式，请配置 OPENAI_API_KEY 或 DASHSCOPE_API_KEY 以启用大模型实时深度问答。"
 
         # Check if LLM emitted an action block
         action = self._parse_action_block(raw_resp)
@@ -354,14 +424,16 @@ class SimpleQAAgent:
                         break
 
             final_trace = "\n\n".join(cumulative_traces)
-            final_report = (
+            explanation = re.sub(r"```action\s*\n.*?\n```", "", raw_resp, flags=re.DOTALL | re.IGNORECASE).strip()
+            summary_block = (
                 f"{final_trace}\n\n"
                 f"---\n"
                 f"### 📋 执行结果总结\n"
                 f"- **目标节点**: `{action.get('node')}`\n"
                 f"- **执行状态**: {'✔ 成功完成并通过全部探针闭环验证' if success else '✖ 经过自愈重试后仍未通过闭环验证'}\n"
-                f"- **运行态已同步**: 该服务已登记入会话工作记忆中，后续可直接通过“从h2测试访问”或“停止刚才的服务”进行多轮联动。"
+                f"- **运行态已同步**: 动作执行与验证结果已登记入会话工作记忆中，可继续发起多轮联动排查。"
             )
+            final_report = f"{explanation}\n\n---\n{summary_block}" if explanation else summary_block
             # Update history and memory
             self.memory.history.append(ChatMessage(role="user", content=question))
             self.memory.history.append(ChatMessage(role="assistant", content=final_report))

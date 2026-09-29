@@ -26,6 +26,7 @@ from langgraph_netagent.llm.providers.qwen_openai import QwenOpenAIProvider
 from langgraph_netagent.tools.clab_adapter import LiveContainerlabAdapter
 from langgraph_netagent.tools.detector import EnvironmentDetector, ExecutionMode
 from langgraph_netagent.tools.mock_engine import MockContainerlabAdapter
+from langgraph_netagent.tools.nic_adapter import LiveNICAdapter
 from langgraph_netagent.workflow.day2_graph import run_day2_workflow
 from langgraph_netagent.workflow.qa_agent import SimpleQAAgent
 
@@ -260,39 +261,67 @@ class InteractiveNetOpsREPL:
             self.do_use(choice)
 
     def do_use(self, target: str) -> None:
-        """Switch active lab topology."""
+        """Switch active lab or NIC network topology dynamically."""
         clean = target.strip()
         if clean.endswith(".yml") or clean.endswith(".yaml"):
             clean = Path(clean).stem
 
-        if clean in ("1", "clos5"):
-            self.lab_name = "clos5"
-            if not isinstance(self.adapter, LiveContainerlabAdapter):
-                self.adapter = LiveContainerlabAdapter(lab_name="clos5", wsl_distro=self.wsl_distro)
+        # Query current dynamic topologies (No presets, real hardware discovery)
+        inv = self.detector.scan_inventory(active_lab=self.lab_name)
+        matched_topo = None
+
+        # 1. Match by numeric ID (e.g. "1", "2", "3", "4"...)
+        for t in inv.available_topologies:
+            if clean == t.id:
+                matched_topo = t
+                break
+
+        # 2. Match by exact or partial name
+        if not matched_topo:
+            for t in inv.available_topologies:
+                if clean.lower() == t.name.lower():
+                    matched_topo = t
+                    break
+        if not matched_topo:
+            for t in inv.available_topologies:
+                if clean.lower() in t.name.lower() or t.name.lower() in clean.lower():
+                    matched_topo = t
+                    break
+
+        if matched_topo:
+            self.lab_name = matched_topo.name
+            if matched_topo.kind == "containerlab":
+                self.adapter = LiveContainerlabAdapter(lab_name=matched_topo.name, wsl_distro=self.wsl_distro)
                 self.mode = "live"
-            else:
-                self.adapter.lab_name = "clos5"
-            self.qa_agent.lab_adapter = self.adapter
-            print(f"{C_GREEN}已成功人工选择并接入网络拓扑: clos5 (真实 Containerlab 容器网卡环境){C_RESET}\n")
+                print(f"{C_GREEN}已成功人工选择并接入 Containerlab 容器网络: {matched_topo.name}{C_RESET}\n")
+            elif matched_topo.kind == "nic_network":
+                self.adapter = LiveNICAdapter(interface_name=matched_topo.name)
+                self.mode = "live"
+                print(f"{C_GREEN}已成功人工选择并接入网卡网络: {matched_topo.name} ({matched_topo.display_type}){C_RESET}\n")
+            elif matched_topo.kind == "in_memory":
+                self.adapter = MockContainerlabAdapter()
+                self.mode = "mock"
+                print(f"{C_GREEN}已成功人工选择并切换至: {matched_topo.name} (内存虚拟仿真模式){C_RESET}\n")
+            self.qa_agent.set_adapter(self.adapter)
             self.do_inspect()
-        elif clean in ("2", "netagent-lab", "mock"):
-            self.lab_name = "netagent-lab"
-            self.adapter = MockContainerlabAdapter()
-            self.mode = "mock"
-            self.qa_agent.lab_adapter = self.adapter
-            print(f"{C_GREEN}已成功人工选择并切换至: netagent-lab (内存虚拟拓扑模式){C_RESET}\n")
+            return
+
+        # Fallback if unindexed
+        self.lab_name = clean
+        if any(k in clean.lower() for k in ("wlan", "eth", "net", "vmnet", "adapter", "meta")):
+            self.adapter = LiveNICAdapter(interface_name=clean)
+            self.mode = "live"
         else:
-            self.lab_name = clean
-            if isinstance(self.adapter, LiveContainerlabAdapter):
-                self.adapter.lab_name = clean
-            self.qa_agent.lab_adapter = self.adapter
-            print(f"{C_GREEN}已将当前目标拓扑设置为: {self.lab_name}{C_RESET}\n")
+            self.adapter = LiveContainerlabAdapter(lab_name=clean, wsl_distro=self.wsl_distro)
+        self.qa_agent.set_adapter(self.adapter)
+        print(f"{C_GREEN}已将当前目标拓扑设置为: {self.lab_name}{C_RESET}\n")
+        self.do_inspect()
 
     def do_inspect(self) -> None:
-        """Inspect running lab containers."""
-        print(f"\n{C_CYAN}正在检查 Containerlab 实验拓扑容器状态...{C_RESET}")
+        """Inspect running lab containers or host NIC endpoints."""
+        print(f"\n{C_CYAN}正在检查网络拓扑节点与通信端点状态...{C_RESET}")
         res = self.adapter.inspect(lab_name=self.lab_name)
-        if (not res.success or not res.nodes) and self.lab_name:
+        if (not res.success or not res.nodes) and self.lab_name and isinstance(self.adapter, LiveContainerlabAdapter):
             # Fallback to inspecting all labs
             res_all = self.adapter.inspect(lab_name=None)
             if res_all.success and res_all.nodes:
@@ -307,12 +336,14 @@ class InteractiveNetOpsREPL:
         if not self.lab_name or self.lab_name == "unknown":
             self.lab_name = res.lab_name
 
-        print(f"\n{C_BOLD}当前绑定实验: {C_GREEN}{self.lab_name}{C_RESET}")
-        print(f"{C_BOLD}{'节点名称':<18} {'容器 ID':<16} {'镜像':<24} {'管理 IPv4':<18} {'状态'}{C_RESET}")
-        print("-" * 88)
+        print(f"\n{C_BOLD}当前绑定网络拓扑: {C_GREEN}{self.lab_name}{C_RESET}")
+        print(f"{C_BOLD}{'节点名称':<42} {'端点/容器 ID':<16} {'类型/镜像':<36} {'管理 IPv4':<18} {'状态'}{C_RESET}")
+        print("-" * 120)
         for n in res.nodes:
             status_color = C_GREEN if n.state == "running" else C_RED
-            print(f"{n.name:<18} {n.container_id[:12]:<16} {n.image[:22]:<24} {str(n.ipv4_address):<18} {status_color}{n.state}{C_RESET}")
+            name_disp = n.name if len(n.name) <= 40 else n.name[:37] + "..."
+            img_disp = n.image if len(n.image) <= 34 else n.image[:31] + "..."
+            print(f"{name_disp:<42} {n.container_id[:14]:<16} {img_disp:<36} {str(n.ipv4_address):<18} {status_color}{n.state}{C_RESET}")
         print()
 
     def do_probe(self) -> None:
@@ -321,7 +352,27 @@ class InteractiveNetOpsREPL:
         # Detect nodes
         insp = self.adapter.inspect(lab_name=self.lab_name)
         if not insp.nodes:
-            print(f"{C_YELLOW}无运行中容器可供探测。{C_RESET}\n")
+            print(f"{C_YELLOW}无运行中节点可供探测。{C_RESET}\n")
+            return
+
+        if isinstance(self.adapter, LiveNICAdapter):
+            print(f"正在向接口 {self.lab_name} 上的活跃节点下发连通性探针...")
+            for n in insp.nodes:
+                raw_ip = (n.ipv4_address or "").split("/")[0]
+                if not raw_ip or raw_ip.startswith("127.") or "本机" in n.name:
+                    continue
+                cmd = f"Test-Connection -ComputerName {raw_ip} -Count 2 -Quiet"
+                ret = self.adapter.exec_command(node_name=n.name, command=cmd, timeout=4)
+                is_ok = ("True" in ret.stdout)
+                res_tag = f"{C_GREEN}[√] [通]{C_RESET}" if is_ok else f"{C_RED}[X] [断]{C_RESET}"
+                extra = ""
+                if is_ok and ("vm" in n.name.lower() or "linux" in n.image.lower()):
+                    tcp_cmd = f"Test-NetConnection -ComputerName {raw_ip} -Port 22 -InformationLevel Quiet"
+                    t_ret = self.adapter.exec_command(node_name=n.name, command=tcp_cmd, timeout=3)
+                    ssh_ok = ("True" in t_ret.stdout)
+                    extra = f" (SSH 端口 22: {'已开放/就绪' if ssh_ok else '未开放'})"
+                print(f"  {res_tag} 本机网卡 -> {n.name} ({raw_ip}){extra}")
+            print()
             return
 
         nodes = [n.name for n in insp.nodes]
@@ -359,8 +410,17 @@ class InteractiveNetOpsREPL:
         print()
 
     def do_routes(self) -> None:
-        """Dump routing tables on routers."""
+        """Dump routing tables on routers or host NIC."""
         print(f"\n{C_CYAN}正在查询核心节点路由表...{C_RESET}")
+        if isinstance(self.adapter, LiveNICAdapter):
+            iface = self.lab_name or getattr(self.adapter, "interface_name", "Host NIC")
+            cmd = f"Get-NetRoute -InterfaceAlias '{iface}' -AddressFamily IPv4 | Select-Object DestinationPrefix, NextHop, RouteMetric | Format-Table -AutoSize"
+            res = self.adapter.exec_command(node_name="host", command=cmd, timeout=6)
+            print(f"\n{C_BOLD}--- 网卡接口 [{iface}] 宿主机核心 IPv4 路由表 ---{C_RESET}")
+            print(res.stdout.strip() if res.stdout else res.stderr)
+            print()
+            return
+
         insp = self.adapter.inspect(lab_name=self.lab_name)
         for n in insp.nodes:
             k = (n.kind or "").lower()

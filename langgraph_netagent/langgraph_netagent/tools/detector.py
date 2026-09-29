@@ -442,7 +442,83 @@ class EnvironmentDetector:
         except Exception:
             pass
 
-        # 4. In-Memory Mock Topology Option
+        # 4. Dynamically Discover All Active Host NIC Networks (Real-time Probe, No Presets)
+        if platform.system().lower() == "windows":
+            try:
+                ps_bin = shutil.which("powershell.exe") or "powershell"
+                ps_script = (
+                    "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { "
+                    "$_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | "
+                    "ForEach-Object { "
+                    "$alias = $_.InterfaceAlias; $ip = $_.IPAddress; $pfx = $_.PrefixLength; "
+                    "$nbrs = @(Get-NetNeighbor -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+                    "Where-Object { $_.IPAddress -notlike '224.*' -and $_.IPAddress -notlike '239.*' -and "
+                    "$_.IPAddress -notlike '255.*' -and $_.LinkLayerAddress -and $_.LinkLayerAddress -notlike '00-00*' -and "
+                    "$_.LinkLayerAddress -notlike 'FF-FF*' -and $_.State -ne 0 }); "
+                    "[PSCustomObject]@{ Interface = $alias; HostIP = $ip; Prefix = $pfx; "
+                    "NeighborCount = $nbrs.Count; NeighborIPs = $nbrs.IPAddress } } | ConvertTo-Json -Compress"
+                )
+                cmd_all = [ps_bin, "-NoProfile", "-NonInteractive", "-Command", ps_script]
+                res_all = subprocess.run(cmd_all, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6)
+                out_all = res_all.stdout.decode("utf-8", errors="replace").strip()
+                if res_all.returncode == 0 and out_all:
+                    raw_data = json.loads(out_all)
+                    adapter_items = raw_data if isinstance(raw_data, list) else [raw_data]
+                    for a in adapter_items:
+                        alias = a.get("Interface", "")
+                        host_ip = a.get("HostIP", "")
+                        prefix = a.get("Prefix", 24)
+                        nbr_cnt = a.get("NeighborCount", 0)
+                        nbr_ips = a.get("NeighborIPs") or []
+                        if isinstance(nbr_ips, str):
+                            nbr_ips = [nbr_ips]
+
+                        # Skip hyper-v vethernet if containerlab already manages containers directly
+                        if "hyper-v" in alias.lower() and "wsl" in alias.lower():
+                            continue
+
+                        # Determine display category dynamically
+                        alias_lower = alias.lower()
+                        if "vmnet" in alias_lower or "vmware" in alias_lower:
+                            disp_type = f"VMware 虚拟机网络 ({alias})"
+                        elif "wlan" in alias_lower or "wi-fi" in alias_lower or "wireless" in alias_lower:
+                            disp_type = f"无线局域网 (Wi-Fi / {alias})"
+                        elif "以太网" in alias_lower or "ethernet" in alias_lower:
+                            disp_type = f"物理有线局域网 ({alias})"
+                        else:
+                            disp_type = f"宿主机网卡网络 ({alias})"
+
+                        tot_nodes = 1 + nbr_cnt
+                        subnet_desc = f"{host_ip}/{prefix}"
+                        summary_msg = f"{tot_nodes} 个在线节点 (本机 {host_ip}, 发现 {nbr_cnt} 个活跃端点)"
+                        if nbr_ips:
+                            sample_ips = ", ".join(nbr_ips[:3])
+                            if len(nbr_ips) > 3:
+                                sample_ips += f" 等 {len(nbr_ips)} 台"
+                            summary_msg += f" [邻居: {sample_ips}]"
+
+                        topo_id = str(len(available_topos) + 1)
+                        is_active_card = (
+                            active_lab is not None
+                            and (alias.lower() == active_lab.lower() or active_lab.lower() in alias_lower)
+                        )
+                        available_topos.append(
+                            DetectedTopology(
+                                id=topo_id,
+                                name=alias,
+                                kind="nic_network",
+                                display_type=disp_type,
+                                node_count=tot_nodes,
+                                status="运行中 (Active)",
+                                summary=summary_msg,
+                                subnet=subnet_desc,
+                                is_active=is_active_card,
+                            )
+                        )
+            except Exception:
+                pass
+
+        # 5. In-Memory Mock Topology Option
         mock_id = str(len(available_topos) + 1)
         available_topos.append(DetectedTopology(
             id=mock_id,

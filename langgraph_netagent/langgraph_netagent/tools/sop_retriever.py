@@ -6,8 +6,12 @@ inferred RAG keywords and 5-tuple failure attributes.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from langgraph_netagent.models.knowledge import DualRetrievalResult, TreeNode
+    from langgraph_netagent.tools.vendor_knowledge import DualRetrievalEngine
 
 
 class SOPDocument(BaseModel):
@@ -447,22 +451,81 @@ DEFAULT_SOPS: List[SOPDocument] = [
 
 
 class SOPRetriever:
-    """Retrieves relevant operational SOPs matching search keywords and failure attributes."""
+    """Retrieves relevant operational SOPs matching search keywords and failure attributes.
 
-    def __init__(self, sops: Optional[List[SOPDocument]] = None):
+    Integrates with DualRetrievalEngine to retrieve tree-backed authoritative vendor
+    templates while preserving fallback to legacy DEFAULT_SOPS playbooks.
+    """
+
+    def __init__(
+        self,
+        sops: Optional[List[SOPDocument]] = None,
+        dual_engine: Optional[DualRetrievalEngine] = None,
+    ):
         self.sops = sops or DEFAULT_SOPS
+        self._dual_engine = dual_engine
 
-    def retrieve(self, keywords: List[str], limit: int = 3) -> List[Dict[str, Any]]:
-        """Find most relevant SOPs based on keyword overlap scoring.
+    @property
+    def dual_engine(self) -> DualRetrievalEngine:
+        """Lazily initialize or return the DualRetrievalEngine instance."""
+        if self._dual_engine is None:
+            from langgraph_netagent.tools.vendor_knowledge import DualRetrievalEngine
+            self._dual_engine = DualRetrievalEngine()
+        return self._dual_engine
+
+    def _dual_result_to_sop_dict(self, result: DualRetrievalResult) -> Dict[str, Any]:
+        """Convert a DualRetrievalResult into a legacy SOPDocument-compatible dictionary."""
+        vendor_tag = result.vendor.upper()
+        clean_path = result.tree_path.replace("/", "-").upper()
+        sop_id = f"SOP-{vendor_tag}-{clean_path}"
+        title = f"{result.vendor.title()} {result.category.replace('_', ' ').title()}: {result.action.replace('_', ' ').title()}"
+        return {
+            "sop_id": sop_id,
+            "title": title,
+            "category": result.category.upper() if result.category else "VENDOR_PLAYBOOK",
+            "keywords": [result.vendor.lower(), result.category.lower(), result.action.lower()] + [p.lower() for p in result.parameters],
+            "symptoms": [f"Operational discrepancy requiring {result.action} on {result.vendor}"],
+            "diagnosis_steps": [f"Inspect configuration and runtime status for {result.tree_path}"],
+            "remediation_template": result.remediation_template,
+            "rollback_template": result.rollback_templates,
+            "tree_path": result.tree_path,
+            "vendor": result.vendor,
+            "score": result.score,
+        }
+
+    def retrieve(
+        self,
+        keywords: List[str],
+        limit: int = 3,
+        vendor: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Find most relevant SOPs based on keyword overlap scoring and dual retrieval.
 
         Args:
             keywords: Inferred RAG search keywords from Stage 1.
             limit: Maximum SOPs to return.
+            vendor: Optional target vendor filter ('cisco', 'huawei', 'frr', 'linux').
 
         Returns:
             List of matching SOP dictionaries ordered by relevance.
         """
         kw_lower = {k.lower().strip() for k in keywords if k}
+
+        # If a vendor is explicitly requested, prioritize tree-backed dual retrieval
+        if vendor:
+            query_str = " ".join(keywords)
+            dual_results = self.dual_engine.retrieve(query=query_str, vendor=vendor, top_k=limit)
+            if dual_results:
+                return [self._dual_result_to_sop_dict(r) for r in dual_results]
+
+        # Check for vendor-specific keywords (e.g. 'cisco', 'huawei') that have no DEFAULT_SOPS
+        vendor_keywords = {"cisco", "huawei"}
+        if any(vk in kw_lower for vk in vendor_keywords):
+            query_str = " ".join(keywords)
+            dual_results = self.dual_engine.retrieve(query=query_str, vendor=vendor, top_k=limit)
+            if dual_results:
+                return [self._dual_result_to_sop_dict(r) for r in dual_results]
+
         scored_sops: List[Tuple[int, SOPDocument]] = []
 
         for sop in self.sops:
@@ -482,11 +545,44 @@ class SOPRetriever:
         scored_sops.sort(key=lambda x: x[0], reverse=True)
         results = [sop.model_dump() for _, sop in scored_sops[:limit]]
 
-        # Fallback to default routing SOP if no matches
+        # If no default SOP matched, fall back to DualRetrievalEngine
+        if not results:
+            query_str = " ".join(keywords)
+            dual_results = self.dual_engine.retrieve(query=query_str, vendor=vendor, top_k=limit)
+            if dual_results:
+                results = [self._dual_result_to_sop_dict(r) for r in dual_results]
+
+        # Fallback to default routing SOP if still empty
         if not results and self.sops:
             results = [self.sops[0].model_dump()]
 
         return results
+
+    def retrieve_dual(
+        self,
+        query: str,
+        vendor: Optional[str] = None,
+        limit: int = 3,
+    ) -> List[DualRetrievalResult]:
+        """Direct dual-retrieval returning tree-backed DualRetrievalResult objects.
+
+        Args:
+            query: Diagnostic symptom or canonical intent string.
+            vendor: Optional vendor filter.
+            limit: Maximum results.
+
+        Returns:
+            List of DualRetrievalResult objects with exact CLI templates (<500B).
+        """
+        return self.dual_engine.retrieve(query=query, vendor=vendor, top_k=limit)
+
+    def retrieve_template_by_path(self, tree_path: str) -> Optional[TreeNode]:
+        """Retrieve an authoritative TreeNode by its exact tree path."""
+        return self.dual_engine.get_template_by_path(tree_path)
+
+    def format_dual_markdown(self, results: List[DualRetrievalResult]) -> str:
+        """Format retrieved dual-retrieval results into concise prompt injection (<500B)."""
+        return self.dual_engine.format_prompt_context(results)
 
     @staticmethod
     def format_sop_markdown(sops: List[Dict[str, Any]]) -> str:

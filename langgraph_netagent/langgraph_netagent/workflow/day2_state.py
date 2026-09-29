@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import operator
 from typing import Any, Dict, List, Optional
+import warnings
 from typing_extensions import Annotated, TypedDict
 
 
@@ -91,6 +92,11 @@ def create_day2_initial_state(
     Returns:
         Fresh Day2OpsState ready for graph execution.
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     initial_log = create_log_entry(
         stage="init",
         message="Day-2 operations workflow initialized",

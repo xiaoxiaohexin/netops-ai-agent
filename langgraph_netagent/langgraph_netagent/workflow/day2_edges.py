@@ -6,6 +6,7 @@ dry-run checks, approval status, and circuit-breaker retry thresholds.
 
 from __future__ import annotations
 from typing import Literal
+import warnings
 from langgraph_netagent.workflow.day2_state import Day2OpsState
 
 
@@ -18,6 +19,11 @@ def route_after_probe(
         - 'end_healthy' if all probes passed (network is healthy).
         - 'hop_pruning' if any failures detected.
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     probe = state.get("probe_results")
     if probe and probe.get("all_passed", False):
         return "end_healthy"
@@ -34,6 +40,11 @@ def route_after_dry_run(
         - 'circuit_breaker' if dry-run failed and retries exhausted.
         - 'llm_diagnosis' if dry-run failed but retries remain (regenerate patch).
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if state.get("dry_run_passed") is True:
         return "human_approval"
 
@@ -53,6 +64,11 @@ def route_after_approval(
         - 'hot_patch' if operator approved.
         - 'end_rejected' if operator rejected.
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if state.get("human_approved") is True:
         return "hot_patch"
     return "end_rejected"
@@ -68,6 +84,11 @@ def route_after_re_verify(
         - 'circuit_breaker' if still failing and retries exhausted.
         - 'llm_diagnosis' if still failing but retries remain (re-diagnose).
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     re_verify = state.get("re_verify_results")
     if re_verify and re_verify.get("all_passed", False):
         return "end_fixed"

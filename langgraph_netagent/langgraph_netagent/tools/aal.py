@@ -50,6 +50,9 @@ class AgentAccessLayer:
         (re.compile(r"\|\s*(?:sudo\s+)?(?:/(?:usr/)?(?:bin|sbin)/)?(?:ba|da|z)?sh\b|\|\s*(?:sudo\s+)?(?:python[0-9.]*|perl|ruby)\b", re.IGNORECASE), "Piping to shell/script interpreter is blocked"),
         (re.compile(r"\bbase64\s+(?:-d|--decode)\b", re.IGNORECASE), "Base64 decode execution is blocked"),
         (re.compile(r"(?:>|>>)\s*(?:/etc/(?:passwd|shadow|sudoers|group))\b", re.IGNORECASE), "Tampering with system authentication files is blocked"),
+        # Destructive table / ruleset flushes
+        (re.compile(r"\b(?:iptables|ip6tables)\s+.*?(?:-[fF]\b|--flush\b|-[xX]\b|--delete-chain\b)", re.IGNORECASE), "Firewall table/chain flush is blocked"),
+        (re.compile(r"\bnft\s+flush\s+(?:ruleset|table)\b", re.IGNORECASE), "nftables ruleset flush is blocked"),
     ]
 
     # Mutating commands disallowed when read_only=True
@@ -66,6 +69,7 @@ class AgentAccessLayer:
         (re.compile(r"\bsed\s+-i\b", re.IGNORECASE), "In-place file editing in read-only mode"),
         (re.compile(r"\b(?:touch|tee|truncate|chmod|chown)\b", re.IGNORECASE), "File modification tool in read-only mode"),
         (re.compile(r"\b(?:cp|mv|rm)\b", re.IGNORECASE), "File copy/move/delete in read-only mode"),
+        (re.compile(r"\bsysctl\s+.*?(?:-w|-p|\=)\b", re.IGNORECASE), "Kernel parameter mutation in read-only mode"),
     ]
 
     def __init__(

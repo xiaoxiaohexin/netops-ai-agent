@@ -13,6 +13,13 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 try:
     from langgraph_netagent import __version__
 except ImportError:
@@ -51,7 +58,7 @@ from langgraph_netagent.models.topology import (
     IPAllocation,
 )
 from langgraph_netagent.tools.clab_adapter import LiveContainerlabAdapter
-from langgraph_netagent.tools.detector import EnvironmentDetector, ExecutionMode
+from langgraph_netagent.tools.detector import EnvironmentDetector, ExecutionMode, SystemNetworkInventory
 from langgraph_netagent.tools.exporter import TopologyExporter
 from langgraph_netagent.tools.mock_engine import MockContainerlabAdapter
 from langgraph_netagent.validation.offline_validator import OfflineValidator
@@ -117,6 +124,53 @@ def _format_stage(stage: str, message: str, level: str = "info") -> str:
     color = color_map.get(level.lower(), "")
     prefix = f"[{level.upper()}]"
     return f"{color}{bold}{prefix:<10}{reset} [{stage}] {message}"
+
+
+def print_scan_inventory(inv: SystemNetworkInventory) -> None:
+    """Print formatted inventory of NICs, bridges, and accessible network topologies."""
+    use_color = _supports_color()
+    bold = COLOR_BOLD if use_color else ""
+    cyan = COLOR_CYAN if use_color else ""
+    green = COLOR_GREEN if use_color else ""
+    yellow = COLOR_YELLOW if use_color else ""
+    dim = "\033[2m" if use_color else ""
+    reset = COLOR_RESET if use_color else ""
+
+    print(f"\n{bold}{cyan}=== 网络资产与拓扑环境检索报告 (Network & Topology Inventory) ==={reset}\n")
+
+    print(f"{bold}1. 宿主机真实网络适配器 (Windows Host NICs):{reset}")
+    if inv.host_interfaces:
+        print(f"  {'网卡名称':<34} {'描述':<44} {'速率'}")
+        print(f"  {'-' * 88}")
+        for nic in inv.host_interfaces:
+            print(f"  {nic.get('name', ''):<34} {nic.get('description', '')[:42]:<44} {nic.get('speed', '')}")
+    else:
+        print(f"  {dim}(未获取到活跃网卡或处于非 Windows 容器环境){reset}")
+
+    print(f"\n{bold}2. WSL 虚拟桥接与容器网卡 (WSL Linux Bridges & Virtual Interfaces):{reset}")
+    if inv.wsl_bridges:
+        print(f"  {'网络接口/网桥':<34} {'状态':<10} {'绑定 IP 网段 / 角色'}")
+        print(f"  {'-' * 88}")
+        for br in inv.wsl_bridges:
+            st_color = green if br.get("state") == "UP" else dim
+            print(f"  {br.get('name', ''):<34} {st_color}{br.get('state', ''):<10}{reset} {br.get('addrs', '')}")
+    else:
+        print(f"  {dim}(未检测到 WSL 网桥){reset}")
+
+    print(f"\n{bold}3. 当前可接入的网络拓扑 (Available Network Topologies):{reset}")
+    print(f"  {'序号':<6} {'拓扑环境类型':<30} {'实验名称':<16} {'节点数':<8} {'详情与状态'}")
+    print(f"  {'-' * 88}")
+    for topo in inv.available_topologies:
+        cur_mark = f" {green}<- [推荐接入]{reset}" if topo.name == inv.recommended_lab else ""
+        print(f"  [{topo.id}]    {topo.display_type:<26} {topo.name:<16} {topo.node_count:<8} {topo.summary}{cur_mark}")
+
+    print(f"\n{bold}人工接入与运行指引:{reset}")
+    print(f"  {yellow}• 交互式控制台人工选择接入:{reset}")
+    print(f"      python -m langgraph_netagent.cli -it")
+    print(f"  {yellow}• 命令行直接绑定真实容器网络 (clos5):{reset}")
+    print(f"      python -m langgraph_netagent.cli --harmonized --mode live --lab-name clos5")
+    print(f"  {yellow}• 命令行绑定纯内存虚拟拓扑 (netagent-lab):{reset}")
+    print(f"      python -m langgraph_netagent.cli --harmonized --mode mock\n")
 
 
 def create_default_mock_llm(user_intent: str) -> MockLLMProvider:
@@ -348,10 +402,22 @@ Examples:
         help="Execute Day-2 Direct Operations Agent against an existing running Containerlab network.",
     )
     parser.add_argument(
+        "--harmonized",
+        action="store_true",
+        default=False,
+        help="Execute harmonized operational workflow across Day-1, Day-2, and Day-3.",
+    )
+    parser.add_argument(
         "--lab-name",
         type=str,
         default=None,
         help="Containerlab lab name for Day-2 operations or inspect/destroy.",
+    )
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        default=False,
+        help="Scan and list host network adapters, WSL container bridges, and discoverable topologies, then exit.",
     )
     parser.add_argument(
         "--watch", "-w",
@@ -424,6 +490,12 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
         parsed_args = parser.parse_args(args)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 1
+
+    if getattr(parsed_args, "scan", False):
+        detector = EnvironmentDetector()
+        inv = detector.scan_inventory()
+        print_scan_inventory(inv)
+        return 0
 
     if parsed_args.interactive:
         from langgraph_netagent.interactive import start_repl
@@ -504,10 +576,20 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
         print(f"[ERROR] Unknown provider: {provider_name}", file=sys.stderr)
         return 1
 
-    # 3. Instantiate Lab Adapter
+    target_lab_name = parsed_args.lab_name
+    if target_lab_name and (target_lab_name.endswith(".yml") or target_lab_name.endswith(".yaml")):
+        target_lab_name = Path(target_lab_name).stem
+        parsed_args.lab_name = target_lab_name
+
     lab_adapter: Any
     if resolved_mode == "live":
-        lab_adapter = LiveContainerlabAdapter(lab_name=parsed_args.lab_name)
+        if not target_lab_name:
+            inv = detector.scan_inventory()
+            if inv.recommended_lab and inv.recommended_lab != "netagent-lab":
+                target_lab_name = inv.recommended_lab
+                parsed_args.lab_name = target_lab_name
+                print(f"[{COLOR_CYAN if use_color else ''}AUTO-DISCOVER{reset}] Auto-detected running Containerlab topology: {COLOR_BOLD if use_color else ''}{target_lab_name}{reset}")
+        lab_adapter = LiveContainerlabAdapter(lab_name=target_lab_name)
     else:
         lab_adapter = MockContainerlabAdapter()
 
@@ -553,7 +635,10 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
 
     # 5. Day-1: Ingest and baseline existing running Containerlab topology (Never deploy private labs in live mode)
     print(f"[{cyan}DAY-1 INGESTION{reset}] Ingesting running topology from Containerlab...")
-    insp = lab_adapter.inspect(lab_name=parsed_args.lab_name)
+    insp = lab_adapter.inspect(lab_name=target_lab_name)
+    if insp.success and insp.nodes and (not target_lab_name or target_lab_name != insp.lab_name):
+        target_lab_name = insp.lab_name
+        parsed_args.lab_name = insp.lab_name
     if resolved_mode != "live" and (not insp.success or not insp.nodes):
         # Auto-seed in-memory mock topology for offline CLI testing
         for candidate in [
@@ -591,10 +676,14 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
         print(_format_stage("human_approval", "Non-interactive mode without auto-approval: operator approval pending/rejected", "warning"))
         return 1
 
-    # 6. Primary Operational Troubleshooting Workflow (UML Conformance)
+    # 6. Primary Operational Troubleshooting Workflow (UML Conformance / Harmonized Day-1/2/3)
     from langgraph_netagent.workflow.operational_graph import run_operational_workflow
+    from langgraph_netagent.workflow.harmonized_graph import run_harmonized_workflow
 
-    print(f"[{cyan}OPERATIONAL{reset}] Executing UML Activity Troubleshooting State Machine...")
+    workflow_runner = run_harmonized_workflow if parsed_args.harmonized else run_operational_workflow
+    flow_desc = "Harmonized Day-1/2/3" if parsed_args.harmonized else "UML Activity"
+
+    print(f"[{cyan}OPERATIONAL{reset}] Executing {flow_desc} Troubleshooting State Machine...")
     print(f"[{cyan}FLOW{reset}]        Baseline Ingestion -> Telemetry/5-Tuple Extraction -> 2-Stage Diagnosis")
     print(f"[{cyan}FLOW{reset}]        -> AAL Sandbox Validation -> Human Approval -> Live Hot-Patch -> Re-verification")
 
@@ -610,7 +699,7 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
                     break
 
                 try:
-                    session_state = run_operational_workflow(
+                    session_state = workflow_runner(
                         llm_provider=llm_provider,
                         lab_adapter=lab_adapter,
                         lab_name=parsed_args.lab_name,
@@ -676,7 +765,7 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
         final_state = session_state or {}
     else:
         try:
-            final_state = run_operational_workflow(
+            final_state = workflow_runner(
                 llm_provider=llm_provider,
                 lab_adapter=lab_adapter,
                 lab_name=parsed_args.lab_name,

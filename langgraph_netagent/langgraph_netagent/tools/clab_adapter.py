@@ -33,7 +33,10 @@ class LiveContainerlabAdapter(BaseNetworkLabAdapter):
         caps = self.detector.detect()
         effective_distro = wsl_distro or caps.wsl_distro
         self.runner = runner or SubprocessRunner(wsl_distro=effective_distro)
-        self.lab_name = lab_name
+        clean_lab = lab_name
+        if clean_lab and (clean_lab.endswith(".yml") or clean_lab.endswith(".yaml")):
+            clean_lab = Path(clean_lab).stem
+        self.lab_name = clean_lab
         self._node_to_container: dict[str, str] = {}
         self._cached_topo_summary: Optional[str] = None
 
@@ -118,6 +121,8 @@ class LiveContainerlabAdapter(BaseNetworkLabAdapter):
     ) -> LabInspectionResult:
         """Inspect running lab containers."""
         target_name = lab_name or self.lab_name
+        if target_name and (target_name.endswith(".yml") or target_name.endswith(".yaml")):
+            target_name = Path(target_name).stem
         cmd = "clab inspect --format json"
         if topo_file:
             topo_p = Path(topo_file)
@@ -139,9 +144,33 @@ class LiveContainerlabAdapter(BaseNetworkLabAdapter):
             )
 
         nodes = self._parse_inspect_json(result.stdout)
+        inferred_lab_name = target_name
+        if not inferred_lab_name or inferred_lab_name == "unknown":
+            try:
+                data = json.loads(result.stdout)
+                containers = []
+                if isinstance(data, list):
+                    containers = data
+                elif isinstance(data, dict):
+                    if "containers" in data and isinstance(data["containers"], list):
+                        containers = data["containers"]
+                    else:
+                        for v in data.values():
+                            if isinstance(v, list):
+                                containers.extend(v)
+                for c in containers:
+                    if isinstance(c, dict) and c.get("lab_name"):
+                        inferred_lab_name = c["lab_name"]
+                        break
+            except Exception:
+                pass
+
+        if inferred_lab_name and inferred_lab_name != "unknown":
+            self.lab_name = inferred_lab_name
+
         return LabInspectionResult(
             success=True,
-            lab_name=target_name or "unknown",
+            lab_name=inferred_lab_name or "unknown",
             nodes=nodes,
             raw_output=result.stdout,
         )

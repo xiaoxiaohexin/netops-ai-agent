@@ -9,6 +9,7 @@ Builds the Day-2 operations graph:
 
 from __future__ import annotations
 from typing import Any, Callable, Dict, Optional
+import warnings
 
 from langgraph_netagent.llm.base import BaseLLMProvider
 from langgraph_netagent.tools.base import BaseNetworkLabAdapter
@@ -83,6 +84,11 @@ def build_day2_graph(
     Returns:
         Compiled runnable state graph.
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     nodes = create_day2_nodes(
         llm_provider=llm_provider,
         lab_adapter=lab_adapter,
@@ -218,6 +224,11 @@ def run_day2_workflow(
     Returns:
         Final Day2OpsState after completion.
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     initial_state = create_day2_initial_state(
         max_retries=max_retries,
         auto_approve=auto_approve,

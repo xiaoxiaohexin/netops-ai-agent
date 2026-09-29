@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 from enum import Enum
+import json
 import os
 from pathlib import Path
 import platform
 import shutil
 import subprocess
-from typing import Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -16,6 +17,32 @@ class ExecutionMode(str, Enum):
     LIVE = "live"
     MOCK = "mock"
     AUTO = "auto"
+
+
+class DetectedTopology(BaseModel):
+    """A detected live or simulated network topology available for binding."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(..., description="Selection ID (e.g. '1', '2')")
+    name: str = Field(..., description="Lab or topology identifier (e.g. 'clos5')")
+    kind: str = Field(..., description="'containerlab' or 'in_memory'")
+    display_type: str = Field(..., description="Human-readable category description")
+    node_count: int = Field(default=0, description="Total nodes in the topology")
+    status: str = Field(..., description="Operating status (Active/Ready)")
+    summary: str = Field(..., description="Summary of nodes, tiers, or subnets")
+    subnet: Optional[str] = Field(default=None, description="Management or underlay subnet")
+    is_active: bool = Field(default=False, description="True if currently active/selected")
+
+
+class SystemNetworkInventory(BaseModel):
+    """Comprehensive inventory of host NICs, WSL bridges, and accessible network topologies."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    host_interfaces: List[Dict[str, Any]] = Field(default_factory=list, description="Host physical/virtual NICs")
+    wsl_bridges: List[Dict[str, Any]] = Field(default_factory=list, description="WSL bridges and container veths")
+    available_topologies: List[DetectedTopology] = Field(default_factory=list, description="Discoverable topologies")
+    recommended_lab: Optional[str] = Field(default=None, description="Recommended default lab name")
+
 
 
 class EnvironmentCapabilities(BaseModel):
@@ -301,3 +328,140 @@ class EnvironmentDetector:
                 return False
 
         return False
+
+    def scan_inventory(self, active_lab: Optional[str] = None) -> SystemNetworkInventory:
+        """Scan host NICs, WSL bridges, and all discoverable network topologies."""
+        host_nics: List[Dict[str, Any]] = []
+        wsl_bridges: List[Dict[str, Any]] = []
+        available_topos: List[DetectedTopology] = []
+
+        # 1. Probe Host Windows NICs
+        if platform.system().lower() == "windows":
+            ps_bin = shutil.which("powershell.exe") or "powershell"
+            cmd = [
+                ps_bin,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object Name, InterfaceDescription, LinkSpeed | ConvertTo-Json -Compress",
+            ]
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                out = res.stdout.decode("utf-8", errors="replace").strip()
+                if res.returncode == 0 and out:
+                    raw = json.loads(out)
+                    items = raw if isinstance(raw, list) else [raw]
+                    for it in items:
+                        host_nics.append({
+                            "name": it.get("Name", "unknown"),
+                            "description": it.get("InterfaceDescription", ""),
+                            "speed": it.get("LinkSpeed", "unknown"),
+                        })
+            except Exception:
+                pass
+
+        # 2. Probe WSL Interfaces & Bridges
+        wsl_bin = shutil.which("wsl.exe") or "wsl"
+        distro = self.wsl_distro or "Ubuntu"
+        try:
+            cmd = [wsl_bin, "-d", distro, "-u", "root", "--", "ip", "-br", "addr"]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+            out = res.stdout.decode("utf-8", errors="replace")
+            if res.returncode == 0 and out:
+                lines = [l for l in out.splitlines() if not l.startswith("wsl:")]
+                veth_count = 0
+                for line in lines:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    ifname = parts[0]
+                    state = parts[1] if len(parts) > 1 else "UNKNOWN"
+                    addrs = " ".join(parts[2:]) if len(parts) > 2 else ""
+                    if ifname.startswith("veth"):
+                        veth_count += 1
+                        continue
+                    wsl_bridges.append({
+                        "name": ifname,
+                        "state": state,
+                        "addrs": addrs,
+                    })
+                if veth_count > 0:
+                    wsl_bridges.append({
+                        "name": f"veth* ({veth_count} 对容器虚拟网卡)",
+                        "state": "UP",
+                        "addrs": "直连容器端口",
+                    })
+        except Exception:
+            pass
+
+        # 3. Probe Live Containerlab Labs
+        try:
+            cmd = [wsl_bin, "-d", distro, "-u", "root", "--", "clab", "inspect", "--all", "--format", "json"]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+            out = res.stdout.decode("utf-8", errors="replace").strip()
+            if res.returncode == 0 and out:
+                data = json.loads(out)
+                containers = []
+                if isinstance(data, list):
+                    containers = data
+                elif isinstance(data, dict):
+                    if "containers" in data and isinstance(data["containers"], list):
+                        containers = data["containers"]
+                    else:
+                        for v in data.values():
+                            if isinstance(v, list):
+                                containers.extend(v)
+
+                labs_map: Dict[str, List[Dict[str, Any]]] = {}
+                for c in containers:
+                    c_name = c.get("name") or c.get("Names", [""])[0] if isinstance(c.get("Names"), list) else str(c.get("Names") or "")
+                    l_name = c.get("lab_name") or c.get("LabName")
+                    if not l_name:
+                        labels = c.get("Labels") or c.get("labels") or {}
+                        l_name = labels.get("clab-node-lab-name") or labels.get("containerlab")
+                    if not l_name and "clab-" in c_name:
+                        parts = c_name.replace("clab-", "").split("-")
+                        l_name = parts[0] if parts else "clos5"
+                    l_name = l_name or "clos5"
+                    labs_map.setdefault(l_name, []).append(c)
+
+                for l_name, c_list in labs_map.items():
+                    topo_id = str(len(available_topos) + 1)
+                    mgmt_net = "172.100.100.0/24"
+                    available_topos.append(DetectedTopology(
+                        id=topo_id,
+                        name=l_name,
+                        kind="containerlab",
+                        display_type="Containerlab (真实容器网卡)",
+                        node_count=len(c_list),
+                        status="运行中 (Active)",
+                        summary=f"{len(c_list)} 个容器节点 (含 leaf, spine, router, hosts)",
+                        subnet=mgmt_net,
+                        is_active=(l_name == active_lab),
+                    ))
+        except Exception:
+            pass
+
+        # 4. In-Memory Mock Topology Option
+        mock_id = str(len(available_topos) + 1)
+        available_topos.append(DetectedTopology(
+            id=mock_id,
+            name="netagent-lab",
+            kind="in_memory",
+            display_type="In-Memory Mock (内存虚拟拓扑)",
+            node_count=3,
+            status="就绪 (Ready)",
+            summary="3 个虚拟节点 (pc1, frr1, pc2), 2 个子网 (纯内存仿真)",
+            subnet="10.1.1.0/24, 10.2.2.0/24",
+            is_active=(active_lab == "netagent-lab"),
+        ))
+
+        rec_lab = available_topos[0].name if available_topos else "netagent-lab"
+
+        return SystemNetworkInventory(
+            host_interfaces=host_nics,
+            wsl_bridges=wsl_bridges,
+            available_topologies=available_topos,
+            recommended_lab=rec_lab,
+        )
+

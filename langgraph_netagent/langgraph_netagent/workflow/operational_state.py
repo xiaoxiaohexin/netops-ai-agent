@@ -77,6 +77,20 @@ class OperationalState(TypedDict):
     last_healthy_timestamp: Optional[str]
     consecutive_healthy_cycles: Optional[int]
 
+    # 10. Milestone 4 Bounded AI Autonomy & Two-Stage Diagnostic Loop
+    canonical_intents: Optional[List[Any]]
+    compilation_results: Optional[List[Any]]
+    preflight_report: Optional[Any]
+    dual_retrieval_results: Optional[List[Any]]
+    autonomy_tier: str
+    step_tag: str
+
+    # 11. Milestone 5 Harmonized Workflow & Phase Boundaries
+    operational_phase: Optional[str]
+    phase_history: Optional[List[str]]
+    vendor_knowledge_indexed: Optional[bool]
+    dual_retrieval_index_built: Optional[bool]
+
 
 def create_operational_initial_state(
     max_retries: int = 3,
@@ -85,6 +99,8 @@ def create_operational_initial_state(
     watch_mode: bool = False,
     watch_interval: float = 5.0,
     max_watch_cycles: Optional[int] = None,
+    autonomy_tier: str = "bounded",
+    step_tag: str = "",
 ) -> OperationalState:
     """Create a fully initialized OperationalState.
 
@@ -95,6 +111,8 @@ def create_operational_initial_state(
         watch_mode: Whether to enable persistent continuous monitoring loop.
         watch_interval: Interval in seconds between healthy monitoring cycles.
         max_watch_cycles: Optional cycle cap before terminating (None for infinite).
+        autonomy_tier: Autonomy level ("bounded", "full_autonomy").
+        step_tag: Monotonic iteration step tracking tag.
 
     Returns:
         Fresh OperationalState ready for LangGraph execution.
@@ -110,6 +128,8 @@ def create_operational_initial_state(
             "watch_mode": watch_mode,
             "watch_interval": watch_interval,
             "max_watch_cycles": max_watch_cycles,
+            "autonomy_tier": autonomy_tier,
+            "step_tag": step_tag,
         },
     )
 
@@ -152,4 +172,15 @@ def create_operational_initial_state(
         "max_watch_cycles": max_watch_cycles,
         "last_healthy_timestamp": None,
         "consecutive_healthy_cycles": 0,
+        "canonical_intents": [],
+        "compilation_results": [],
+        "preflight_report": None,
+        "dual_retrieval_results": [],
+        "autonomy_tier": autonomy_tier,
+        "step_tag": step_tag,
+        "operational_phase": "day1",
+        "phase_history": ["day1"],
+        "vendor_knowledge_indexed": False,
+        "dual_retrieval_index_built": False,
     }
+

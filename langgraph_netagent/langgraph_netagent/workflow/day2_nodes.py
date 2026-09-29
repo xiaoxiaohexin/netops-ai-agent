@@ -11,6 +11,7 @@ import copy
 import json
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import warnings
 
 from pydantic import BaseModel
 
@@ -66,6 +67,11 @@ def create_day2_nodes(
     Returns:
         Dictionary mapping node names to callable handler functions.
     """
+    warnings.warn(
+        "Day2 linear nodes are deprecated; please use harmonized operational workflow",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     def read_baseline_node(state: Day2OpsState) -> Dict[str, Any]:
         """Node 1: Read live baseline from running Containerlab network.

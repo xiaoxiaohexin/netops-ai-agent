@@ -51,9 +51,29 @@ from langgraph_netagent.tools.aal import (
 from langgraph_netagent.tools.sandbox import (
     ShadowSandboxManager,
 )
+from langgraph_netagent.tools.sandbox_runtime import (
+    AutoGarbageCollector,
+    DockerRuntimeError,
+    DockerSandboxRuntime,
+    DockerUnavailableError,
+    MockSandboxRuntime,
+    create_sandbox_runtime,
+    is_docker_available,
+)
 from langgraph_netagent.tools.sop_retriever import (
     SOPDocument,
     SOPRetriever,
+)
+from langgraph_netagent.tools.intent_compiler import (
+    CanonicalIntentCompiler,
+    compile_canonical_intent,
+    compile_remediation_plan,
+)
+from langgraph_netagent.tools.vendor_knowledge import (
+    CommandTreeStore,
+    DualRetrievalEngine,
+    LightweightVectorIndex,
+    VendorDocIngestor,
 )
 
 __all__ = [
@@ -97,6 +117,22 @@ __all__ = [
     "AgentAccessLayer",
     "AALSecurityError",
     "ShadowSandboxManager",
+    "DockerSandboxRuntime",
+    "MockSandboxRuntime",
+    "AutoGarbageCollector",
+    "create_sandbox_runtime",
+    "DockerRuntimeError",
+    "DockerUnavailableError",
+    "is_docker_available",
     "SOPRetriever",
     "SOPDocument",
+    # Intent Compiler
+    "CanonicalIntentCompiler",
+    "compile_canonical_intent",
+    "compile_remediation_plan",
+    # Vendor Knowledge & Dual-Retrieval
+    "CommandTreeStore",
+    "LightweightVectorIndex",
+    "VendorDocIngestor",
+    "DualRetrievalEngine",
 ]

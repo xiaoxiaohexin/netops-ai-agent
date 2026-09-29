@@ -40,6 +40,17 @@ from langgraph_netagent.workflow.operational_graph import (
     build_operational_graph,
     run_operational_workflow,
 )
+from langgraph_netagent.workflow.harmonized_graph import (
+    HarmonizedGraph,
+    HarmonizedOperationalGraph,
+    HarmonizedOpsState,
+    HarmonizedState,
+    OperationalPhase,
+    build_harmonized_graph,
+    create_harmonized_initial_state,
+    create_harmonized_nodes,
+    run_harmonized_workflow,
+)
 
 __all__ = [
     "LogEntry",
@@ -69,4 +80,14 @@ __all__ = [
     "route_after_sandbox",
     "route_after_operational_approval",
     "route_after_re_verification",
+    # Harmonized workflow (Milestone 5)
+    "HarmonizedOperationalGraph",
+    "HarmonizedGraph",
+    "HarmonizedState",
+    "HarmonizedOpsState",
+    "OperationalPhase",
+    "build_harmonized_graph",
+    "run_harmonized_workflow",
+    "create_harmonized_initial_state",
+    "create_harmonized_nodes",
 ]

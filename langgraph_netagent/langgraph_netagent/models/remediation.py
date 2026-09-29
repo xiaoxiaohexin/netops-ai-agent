@@ -28,15 +28,7 @@ class ConfigurationPatch(BaseModel):
     backup_content: Optional[str] = Field(default=None, description="Original content for rollback")
 
 
-class RollbackStep(BaseModel):
-    """Explicit step required to safely reverse remediation if verification fails."""
-    model_config = ConfigDict(populate_by_name=True)
-
-    step_order: int = Field(..., description="Sequential execution index (1, 2, 3...)")
-    description: str = Field(..., description="Explanation of the rollback action")
-    action: str = Field(..., description="Rollback action type ('RESTORE_FILE', 'EXEC_COMMAND')")
-    target_node: str = Field(..., description="Node or container where rollback is executed")
-    payload: Optional[str] = Field(default=None, description="Command string or original content to restore")
+from langgraph_netagent.models.intent import RollbackStep
 
 
 class RemediationPlan(BaseModel):

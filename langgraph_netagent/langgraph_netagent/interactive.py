@@ -62,7 +62,9 @@ def print_help() -> None:
     print(f"""
 {C_BOLD}可用交互指令列表:{C_RESET}
   {C_CYAN}/All <问题>{C_RESET} (或 {C_CYAN}/all{C_RESET})          : 直接与 AI 智能助手自由问答 (无范围限制)
-  {C_CYAN}1. inspect{C_RESET} (或 {C_CYAN}status{C_RESET})       : 探测所有运行中的 Containerlab 容器与管理 IP
+  {C_CYAN}0. scan{C_RESET} (或 {C_CYAN}networks{C_RESET}, {C_CYAN}topo{C_RESET}) : 扫描所有网卡/容器/内存拓扑并支持手动交互切换
+  {C_CYAN}use <lab_name>{C_RESET}               : 切换 Agent 当前绑定的网络实验拓扑 (如: use clos5)
+  {C_CYAN}1. inspect{C_RESET} (或 {C_CYAN}status{C_RESET})       : 探测当前绑定的 Containerlab 容器与管理 IP
   {C_CYAN}2. probe{C_RESET} (或 {C_CYAN}ping{C_RESET})           : 对网络节点执行连通性与丢包率探针矩阵
   {C_CYAN}3. routes{C_RESET}                    : 抓取并打印路由器与主机的核心路由表
   {C_CYAN}4. diagnose{C_RESET} (或 {C_CYAN}heal{C_RESET})         : 启动 LangGraph Day-2 自动排障诊断与热修复闭环
@@ -138,6 +140,10 @@ class InteractiveNetOpsREPL:
     def run(self) -> None:
         """Main REPL loop."""
         print_banner(mode=self.mode, distro=self.wsl_distro)
+        if not self.lab_name:
+            self.do_scan_networks(prompt_select=True)
+        else:
+            self.do_inspect()
 
         while True:
             try:
@@ -167,8 +173,13 @@ class InteractiveNetOpsREPL:
             if cmd in ("exit", "quit", "q"):
                 print(f"{C_DIM}已退出控制台。再见！{C_RESET}")
                 break
-            elif cmd in ("help", "?"):
-                print_help()
+            elif cmd in ("0", "scan", "networks", "topo"):
+                self.do_scan_networks(prompt_select=True)
+            elif cmd in ("use", "select"):
+                if len(parts) < 2:
+                    print(f"{C_YELLOW}用法: use <lab_name 或 序号>{C_RESET} (例如: use clos5 或 use 1)")
+                else:
+                    self.do_use(parts[1])
             elif cmd in ("1", "inspect", "status"):
                 self.do_inspect()
             elif cmd in ("2", "probe", "ping"):
@@ -203,15 +214,101 @@ class InteractiveNetOpsREPL:
             else:
                 print(f"{C_RED}未知指令: '{cmd}'。输入 'help' 查看所有可用指令。{C_RESET}")
 
+    def do_scan_networks(self, prompt_select: bool = False) -> None:
+        """Scan and list all detected interactive networks, containers, and NICs."""
+        print(f"\n{C_CYAN}正在检索宿主机网卡、WSL 网桥与网络拓扑环境...{C_RESET}")
+        inv = self.detector.scan_inventory(active_lab=self.lab_name)
+
+        print(f"\n{C_BOLD}1. 宿主机真实网络适配器 (Windows Host NICs):{C_RESET}")
+        if inv.host_interfaces:
+            print(f"  {'网卡名称':<34} {'描述':<44} {'速率'}")
+            print(f"  {'-' * 88}")
+            for nic in inv.host_interfaces:
+                print(f"  {nic.get('name', ''):<34} {nic.get('description', '')[:42]:<44} {nic.get('speed', '')}")
+        else:
+            print(f"  {C_DIM}(未检测到活跃网卡){C_RESET}")
+
+        print(f"\n{C_BOLD}2. WSL 虚拟桥接与容器网卡 (WSL Linux Bridges & Virtual Interfaces):{C_RESET}")
+        if inv.wsl_bridges:
+            print(f"  {'网络接口/网桥':<34} {'状态':<10} {'绑定 IP 网段 / 角色'}")
+            print(f"  {'-' * 88}")
+            for br in inv.wsl_bridges:
+                st_color = C_GREEN if br.get("state") == "UP" else C_DIM
+                print(f"  {br.get('name', ''):<34} {st_color}{br.get('state', ''):<10}{C_RESET} {br.get('addrs', '')}")
+        else:
+            print(f"  {C_DIM}(未检测到 WSL 网桥){C_RESET}")
+
+        print(f"\n{C_BOLD}3. 当前可接入的网络拓扑 (Available Network Topologies):{C_RESET}")
+        print(f"  {'序号':<6} {'拓扑环境类型':<30} {'实验名称':<16} {'节点数':<8} {'详情与状态'}")
+        print(f"  {'-' * 88}")
+        for topo in inv.available_topologies:
+            cur_mark = f" {C_GREEN}<- [当前绑定]{C_RESET}" if topo.name == self.lab_name else (
+                f" {C_YELLOW}<- [推荐接入]{C_RESET}" if (not self.lab_name and topo.name == inv.recommended_lab) else ""
+            )
+            print(f"  [{topo.id}]    {topo.display_type:<26} {topo.name:<16} {topo.node_count:<8} {topo.summary}{cur_mark}")
+
+        print(f"\n{C_DIM}提示: 输入 {C_CYAN}use <实验名称 或 序号>{C_RESET}{C_DIM} 即可人工选择接入对应网络。{C_RESET}\n")
+
+        if prompt_select and sys.stdin.isatty():
+            def_choice = self.lab_name or inv.recommended_lab or "1"
+            try:
+                choice = input(f"{C_BOLD}{C_YELLOW}请选择要接入的网络拓扑序号或名称 [默认: {def_choice}]: {C_RESET}").strip()
+            except (KeyboardInterrupt, EOFError):
+                choice = ""
+            if not choice:
+                choice = def_choice
+            self.do_use(choice)
+
+    def do_use(self, target: str) -> None:
+        """Switch active lab topology."""
+        clean = target.strip()
+        if clean.endswith(".yml") or clean.endswith(".yaml"):
+            clean = Path(clean).stem
+
+        if clean in ("1", "clos5"):
+            self.lab_name = "clos5"
+            if not isinstance(self.adapter, LiveContainerlabAdapter):
+                self.adapter = LiveContainerlabAdapter(lab_name="clos5", wsl_distro=self.wsl_distro)
+                self.mode = "live"
+            else:
+                self.adapter.lab_name = "clos5"
+            self.qa_agent.lab_adapter = self.adapter
+            print(f"{C_GREEN}已成功人工选择并接入网络拓扑: clos5 (真实 Containerlab 容器网卡环境){C_RESET}\n")
+            self.do_inspect()
+        elif clean in ("2", "netagent-lab", "mock"):
+            self.lab_name = "netagent-lab"
+            self.adapter = MockContainerlabAdapter()
+            self.mode = "mock"
+            self.qa_agent.lab_adapter = self.adapter
+            print(f"{C_GREEN}已成功人工选择并切换至: netagent-lab (内存虚拟拓扑模式){C_RESET}\n")
+        else:
+            self.lab_name = clean
+            if isinstance(self.adapter, LiveContainerlabAdapter):
+                self.adapter.lab_name = clean
+            self.qa_agent.lab_adapter = self.adapter
+            print(f"{C_GREEN}已将当前目标拓扑设置为: {self.lab_name}{C_RESET}\n")
+
     def do_inspect(self) -> None:
         """Inspect running lab containers."""
         print(f"\n{C_CYAN}正在检查 Containerlab 实验拓扑容器状态...{C_RESET}")
         res = self.adapter.inspect(lab_name=self.lab_name)
+        if (not res.success or not res.nodes) and self.lab_name:
+            # Fallback to inspecting all labs
+            res_all = self.adapter.inspect(lab_name=None)
+            if res_all.success and res_all.nodes:
+                res = res_all
+                self.lab_name = res.lab_name
+                print(f"{C_GREEN}自动发现并切换至运行中的实验: '{self.lab_name}'{C_RESET}")
+
         if not res.success or not res.nodes:
             print(f"{C_YELLOW}未检测到正在运行的实验节点或 inspect 失败: {res.error_message}{C_RESET}\n")
             return
 
-        print(f"\n{C_BOLD}{'节点名称':<18} {'容器 ID':<16} {'镜像':<24} {'管理 IPv4':<18} {'状态'}{C_RESET}")
+        if not self.lab_name or self.lab_name == "unknown":
+            self.lab_name = res.lab_name
+
+        print(f"\n{C_BOLD}当前绑定实验: {C_GREEN}{self.lab_name}{C_RESET}")
+        print(f"{C_BOLD}{'节点名称':<18} {'容器 ID':<16} {'镜像':<24} {'管理 IPv4':<18} {'状态'}{C_RESET}")
         print("-" * 88)
         for n in res.nodes:
             status_color = C_GREEN if n.state == "running" else C_RED

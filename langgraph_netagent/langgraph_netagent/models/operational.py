@@ -427,3 +427,27 @@ class ShadowSandboxResult(BaseModel):
     all_passed: bool
     output_logs: List[Dict[str, Any]] = Field(default_factory=list)
     error_message: Optional[str] = None
+
+
+# =============================================================================
+# Milestone 4: Bounded AI Autonomy State Data Contracts
+# =============================================================================
+
+from langgraph_netagent.models.intent import CanonicalIntent, CompilationResult
+from langgraph_netagent.models.knowledge import DualRetrievalResult
+from langgraph_netagent.models.sandbox import PreflightSandboxPassReport
+
+
+class BoundedAutonomyState(BaseModel):
+    """Declarative state model capturing Milestone 4 Bounded AI Autonomy attributes."""
+    canonical_intents: List[CanonicalIntent] = Field(default_factory=list)
+    compilation_results: List[CompilationResult] = Field(default_factory=list)
+    preflight_report: Optional[PreflightSandboxPassReport] = None
+    dual_retrieval_results: List[DualRetrievalResult] = Field(default_factory=list)
+    autonomy_tier: str = "bounded"
+    step_tag: str = ""
+
+
+# Alias for flexible importing
+OperationalStateData = BoundedAutonomyState
+

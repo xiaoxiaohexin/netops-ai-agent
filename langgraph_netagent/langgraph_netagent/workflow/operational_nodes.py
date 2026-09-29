@@ -34,6 +34,14 @@ from langgraph_netagent.models.operational import (
     NetworkDiscrepancy,
     ShadowSandboxResult,
 )
+from langgraph_netagent.models.intent import (
+    CanonicalIntent,
+    CompilationResult,
+    IntentAction,
+    TargetPlatform,
+)
+from langgraph_netagent.models.knowledge import DualRetrievalResult
+from langgraph_netagent.models.sandbox import PreflightSandboxPassReport
 from langgraph_netagent.models.remediation import (
     RemediationActionType,
     RemediationPlan,
@@ -47,6 +55,7 @@ from langgraph_netagent.prompts.day2_prompts import (
 from langgraph_netagent.tools.aal import AgentAccessLayer
 from langgraph_netagent.tools.base import BaseNetworkLabAdapter
 from langgraph_netagent.tools.baseline import BaselineCollector
+from langgraph_netagent.tools.intent_compiler import CanonicalIntentCompiler
 from langgraph_netagent.tools.probes import NetworkTelemetryCollector, PingProbe
 from langgraph_netagent.tools.sandbox import ShadowSandboxManager
 from langgraph_netagent.tools.sop_retriever import SOPRetriever
@@ -55,6 +64,7 @@ from langgraph_netagent.workflow.operational_state import (
     OperationalState,
     create_log_entry,
 )
+
 
 
 def classify_anomaly(
@@ -890,9 +900,12 @@ def create_operational_nodes(
         return {
             "enriched_context": enriched_context,
             "rag_keywords": rag_keywords,
+            "autonomy_tier": "full_autonomy",
+            "step_tag": state.get("step_tag", ""),
             "status": "stage1_enriched",
             "execution_logs": [log],
         }
+
 
     # -----------------------------------------------------------------------
     # Node 4: Diagnostic Stage 2 (Targeted Plan Generation & Step-Tagging)
@@ -920,13 +933,18 @@ def create_operational_nodes(
             return {
                 "circuit_breaker_tripped": True,
                 "status": "circuit_broken",
+                "autonomy_tier": "bounded",
                 "error_message": f"Retry threshold exceeded ({retry_count}/{max_retries})",
                 "execution_logs": [log],
             }
 
-        # 2. Retrieve SOP Playbook context
+        # 2. Retrieve Dual Knowledge & SOP Playbook context
+        query_str = " ".join(rag_keywords) if rag_keywords else "network troubleshooting"
+        dual_results = retriever.retrieve_dual(query=query_str, limit=3)
+        dual_retrieval_results = [r.model_dump() if hasattr(r, "model_dump") else r for r in dual_results]
         retrieved_sop = retriever.retrieve(keywords=rag_keywords, limit=2)
         sop_markdown = retriever.format_sop_markdown(retrieved_sop)
+        dual_markdown = retriever.format_dual_markdown(dual_results) if dual_results else ""
 
         is_overload = (
             anomaly_category == "external_overload"
@@ -998,12 +1016,83 @@ def create_operational_nodes(
                 if not dport and f.get("destination_port"):
                     dport = f.get("destination_port")
 
+            proto_str = str(proto).lower() if proto else "tcp"
+            is_l4_port_proto = proto_str in ("tcp", "udp")
+            has_valid_port = dport is not None and str(dport) not in ("0", "None", "")
+
+            # Synthesize CanonicalIntent primitives
+            canonical_intents: List[CanonicalIntent] = []
+            target_platform = TargetPlatform.LINUX_IPTABLES
+
+            if victim_destination_ip and is_l4_port_proto and has_valid_port:
+                canonical_intents.append(
+                    CanonicalIntent(
+                        action=IntentAction.DROP_TRAFFIC,
+                        target_node=target_node,
+                        target_platform=target_platform,
+                        source_ip=offending_source_ip,
+                        destination_ip=victim_destination_ip,
+                        protocol=proto_str,
+                        destination_port=int(dport),
+                        description=f"Drop fine-grained traffic from {offending_source_ip} to {victim_destination_ip}:{dport}",
+                    )
+                )
+            elif victim_destination_ip:
+                canonical_intents.append(
+                    CanonicalIntent(
+                        action=IntentAction.DROP_TRAFFIC,
+                        target_node=target_node,
+                        target_platform=target_platform,
+                        source_ip=offending_source_ip,
+                        destination_ip=victim_destination_ip,
+                        description=f"Drop traffic from {offending_source_ip} to {victim_destination_ip}",
+                    )
+                )
+
+            canonical_intents.append(
+                CanonicalIntent(
+                    action=IntentAction.DROP_TRAFFIC,
+                    target_node=target_node,
+                    target_platform=target_platform,
+                    source_ip=offending_source_ip,
+                    description=f"Perimeter boundary drop for offending source {offending_source_ip}",
+                )
+            )
+
+            # Subnet-level perimeter containment against dynamic IP rotation/aliasing
+            offending_subnet = None
+            if offending_source_ip:
+                for sn in inventory.get("subnets", []):
+                    sn_clean = sn.split("/")[0]
+                    prefix_3 = sn_clean.rsplit(".", 1)[0]
+                    if sn.startswith("192.168.100.") or offending_source_ip.startswith(prefix_3 + "."):
+                        offending_subnet = sn if "/" in sn else f"{sn}/24"
+                        break
+                if not offending_subnet and offending_source_ip.startswith("192.168.100."):
+                    offending_subnet = "192.168.100.0/24"
+
+            if offending_subnet:
+                canonical_intents.append(
+                    CanonicalIntent(
+                        action=IntentAction.DROP_TRAFFIC,
+                        target_node=target_node,
+                        target_platform=target_platform,
+                        source_ip=offending_subnet,
+                        description=f"Subnet boundary drop rule for {offending_subnet}",
+                    )
+                )
+
+            # Compile canonical intents into platform commands with reverse topological rollbacks
+            compiler = CanonicalIntentCompiler(validator=agent_access_layer)
+            compilation_results = compiler.compile_plan(canonical_intents)
+
             diag_report = None
             remed_plan = None
 
             prompt = (
                 f"## Enriched Diagnostic Context\n{json.dumps(enriched, indent=2)}\n\n"
                 f"## Retrieved SOP Playbooks\n{sop_markdown}\n\n"
+                f"## Dual-Retrieval Vendor Knowledge\n{dual_markdown}\n\n"
                 f"## Failures (5-Tuple)\n{json.dumps(failure_5tuples)}\n\n"
                 f"## Discrepancies\n{json.dumps(discrepancies)}\n\n"
                 f"Generate an actionable DiagnosticReport and RemediationPlan for target '{target_node}' to mitigate traffic overload via iptables."
@@ -1028,77 +1117,18 @@ def create_operational_nodes(
             if not isinstance(remed_plan, RemediationPlan) or not any("iptables" in cmd for cmd in (remed_plan.exec_commands or [])):
                 patch_cmds = []
                 rollback_steps = []
-
-                proto_str = str(proto).lower() if proto else "tcp"
-                is_l4_port_proto = proto_str in ("tcp", "udp")
-                has_valid_port = dport is not None and str(dport) not in ("0", "None", "")
-
-                if victim_destination_ip and is_l4_port_proto and has_valid_port:
-                    fine_cmd = f"iptables -I FORWARD -s {offending_source_ip} -d {victim_destination_ip} -p {proto_str} --dport {dport} -j DROP"
-                    fine_rb = f"iptables -D FORWARD -s {offending_source_ip} -d {victim_destination_ip} -p {proto_str} --dport {dport} -j DROP"
-                    patch_cmds.append(fine_cmd)
-                    rollback_steps.append(
-                        RollbackStep(
-                            step_order=len(rollback_steps) + 1,
-                            description=f"Remove fine-grained drop rule for {offending_source_ip}",
-                            action="EXEC_COMMAND",
-                            target_node=target_node,
-                            payload=fine_rb,
-                        )
-                    )
-                elif victim_destination_ip:
-                    fine_cmd = f"iptables -I FORWARD -s {offending_source_ip} -d {victim_destination_ip} -j DROP"
-                    fine_rb = f"iptables -D FORWARD -s {offending_source_ip} -d {victim_destination_ip} -j DROP"
-                    patch_cmds.append(fine_cmd)
-                    rollback_steps.append(
-                        RollbackStep(
-                            step_order=len(rollback_steps) + 1,
-                            description=f"Remove fine-grained drop rule for {offending_source_ip}",
-                            action="EXEC_COMMAND",
-                            target_node=target_node,
-                            payload=fine_rb,
-                        )
-                    )
-
-                boundary_cmd = f"iptables -I FORWARD -s {offending_source_ip} -j DROP"
-                boundary_rb = f"iptables -D FORWARD -s {offending_source_ip} -j DROP"
-                patch_cmds.append(boundary_cmd)
-                rollback_steps.append(
-                    RollbackStep(
-                        step_order=len(rollback_steps) + 1,
-                        description=f"Remove boundary drop rule for {offending_source_ip}",
-                        action="EXEC_COMMAND",
-                        target_node=target_node,
-                        payload=boundary_rb,
-                    )
-                )
-
-                # Subnet-level perimeter containment against dynamic IP rotation/aliasing
-                offending_subnet = None
-                if offending_source_ip:
-                    for sn in inventory.get("subnets", []):
-                        sn_clean = sn.split("/")[0]
-                        prefix_3 = sn_clean.rsplit(".", 1)[0]
-                        if sn.startswith("192.168.100.") or offending_source_ip.startswith(prefix_3 + "."):
-                            offending_subnet = sn if "/" in sn else f"{sn}/24"
-                            break
-                    if not offending_subnet and offending_source_ip.startswith("192.168.100."):
-                        offending_subnet = "192.168.100.0/24"
-
-                if offending_subnet:
-                    subnet_cmd = f"iptables -I FORWARD -s {offending_subnet} -j DROP"
-                    subnet_rb = f"iptables -D FORWARD -s {offending_subnet} -j DROP"
-                    if subnet_cmd not in patch_cmds:
-                        patch_cmds.append(subnet_cmd)
-                        rollback_steps.append(
-                            RollbackStep(
-                                step_order=len(rollback_steps) + 1,
-                                description=f"Remove subnet boundary drop rule for {offending_subnet}",
-                                action="EXEC_COMMAND",
-                                target_node=target_node,
-                                payload=subnet_rb,
-                            )
-                        )
+                for cr in compilation_results:
+                    for cmd in cr.forward_commands:
+                        if cmd not in patch_cmds:
+                            patch_cmds.append(cmd)
+                for cr in reversed(compilation_results):
+                    for step in cr.rollback_steps:
+                        rollback_steps.append(step)
+                for idx, step in enumerate(rollback_steps, start=1):
+                    step.step_number = idx
+                    step.step_order = idx
+                    if not step.target_node:
+                        step.target_node = target_node
 
                 diag_report = DiagnosticReport(
                     telemetry_trigger="Qdisc queue buffer overlimit and packet drops surging on border gateway",
@@ -1142,11 +1172,78 @@ def create_operational_nodes(
                 target_node = suspects[0] if suspects else "frr1"
 
             target_kind = state.get("node_kinds", {}).get(target_node, "frr")
+            target_disc = next((d for d in discrepancies if d.get("node") == target_node), {})
+
+            canonical_intents = []
+            if target_disc.get("discrepancy_type") == "interface_down":
+                target_iface = target_disc.get("affected_interface") or "eth1"
+                canonical_intents.append(
+                    CanonicalIntent(
+                        action=IntentAction.RESET_INTERFACE,
+                        target_node=target_node,
+                        target_platform=TargetPlatform.LINUX_FRR if target_kind == "frr" else TargetPlatform.LINUX_IPTABLES,
+                        interface=target_iface,
+                        description=f"Reset/restore interface {target_iface} on {target_node}",
+                    )
+                )
+            else:
+                target_subnet = "10.2.2.0/24"
+                for disc in discrepancies:
+                    if disc.get("target_destination"):
+                        target_subnet = disc.get("target_destination")
+                        break
+
+                # Derive intelligent next-hop from baseline routes or topology path
+                next_hop = None
+                inv_pool = state.get("inventory_pool") or {}
+                baseline_rts = inv_pool.get("baseline_routes", {}).get(target_node, [])
+                for r in baseline_rts:
+                    if r.get("next_hop") and r.get("destination") == target_subnet:
+                        next_hop = r.get("next_hop")
+                        break
+                if not next_hop:
+                    for r in baseline_rts:
+                        if r.get("next_hop"):
+                            next_hop = r.get("next_hop")
+                            break
+                if not next_hop:
+                    topo = state.get("topology_path") or []
+                    if target_node in topo:
+                        idx = topo.index(target_node)
+                        adj_nodes = []
+                        if idx + 1 < len(topo):
+                            adj_nodes.append(topo[idx + 1])
+                        if idx - 1 >= 0:
+                            adj_nodes.append(topo[idx - 1])
+                        nodes_data = (state.get("baseline") or {}).get("nodes", {})
+                        for adj in adj_nodes:
+                            link_ips = _extract_link_ips(nodes_data, target_node, adj)
+                            if link_ips:
+                                next_hop = link_ips[0]
+                                break
+                if not next_hop:
+                    next_hop = "10.1.12.2"
+
+                canonical_intents.append(
+                    CanonicalIntent(
+                        action=IntentAction.RESTORE_ROUTE,
+                        target_node=target_node,
+                        target_platform=TargetPlatform.LINUX_FRR if target_kind == "frr" else TargetPlatform.LINUX_IPTABLES,
+                        network_prefix=target_subnet,
+                        next_hop=next_hop,
+                        description=f"Restore missing static route to {target_subnet} via {next_hop} on {target_node}",
+                    )
+                )
+
+            # Compile canonical intents into platform commands with reverse topological rollbacks
+            compiler = CanonicalIntentCompiler(validator=agent_access_layer)
+            compilation_results = compiler.compile_plan(canonical_intents)
 
             # Formulate diagnosis and remediation plan via LLM or deterministic fallback
             prompt = (
                 f"## Enriched Diagnostic Context\n{json.dumps(enriched, indent=2)}\n\n"
                 f"## Retrieved SOP Playbooks\n{sop_markdown}\n\n"
+                f"## Dual-Retrieval Vendor Knowledge\n{dual_markdown}\n\n"
                 f"## Failures (5-Tuple)\n{json.dumps(failure_5tuples)}\n\n"
                 f"## Discrepancies\n{json.dumps(discrepancies)}\n\n"
                 f"Generate an actionable DiagnosticReport and RemediationPlan for target '{target_node}'."
@@ -1173,11 +1270,27 @@ def create_operational_nodes(
                 ]
                 remed_plan = llm_provider.generate_structured(messages=rem_messages, response_schema=RemediationPlan)
             except Exception:
-                target_disc = next((d for d in discrepancies if d.get("node") == target_node), {})
+                diag_report = None
+                remed_plan = None
+
+            if not isinstance(remed_plan, RemediationPlan):
+                patch_cmds = []
+                rollback_steps = []
+                for cr in compilation_results:
+                    for cmd in cr.forward_commands:
+                        if cmd not in patch_cmds:
+                            patch_cmds.append(cmd)
+                for cr in reversed(compilation_results):
+                    for step in cr.rollback_steps:
+                        rollback_steps.append(step)
+                for idx, step in enumerate(rollback_steps, start=1):
+                    step.step_number = idx
+                    step.step_order = idx
+                    if not step.target_node:
+                        step.target_node = target_node
+
                 if target_disc.get("discrepancy_type") == "interface_down":
                     target_iface = target_disc.get("affected_interface") or "eth1"
-                    patch_cmd = f"ip link set dev {target_iface} up"
-                    rollback_cmd = f"ip link set dev {target_iface} down"
                     diag_report = DiagnosticReport(
                         telemetry_trigger=f"Interface {target_node}:{target_iface} operstate down",
                         root_cause=f"Network interface {target_iface} on {target_node} is down",
@@ -1190,90 +1303,29 @@ def create_operational_nodes(
                     remed_plan = RemediationPlan(
                         action_type=RemediationActionType.EXEC_RUNTIME_COMMAND,
                         target_entity=target_node,
-                        exec_commands=[patch_cmd],
-                        rollback_steps=[
-                            RollbackStep(
-                                step_order=1,
-                                description=f"Bring down interface {target_iface} on {target_node}",
-                                action="EXEC_COMMAND",
-                                target_node=target_node,
-                                payload=rollback_cmd,
-                            )
-                        ],
+                        exec_commands=patch_cmds,
+                        rollback_steps=rollback_steps,
                         expected_outcome=f"Interface {target_iface} on {target_node} restored to UP state",
                         estimated_risk=SeverityLevel.LOW,
                     )
                 else:
-                    # Deterministic synthesis from SOP & discrepancy
-                    target_subnet = "10.2.2.0/24"
-                    for disc in discrepancies:
-                        if disc.get("target_destination"):
-                            target_subnet = disc.get("target_destination")
-                            break
-
-                # Derive intelligent next-hop from baseline routes or topology path
-                next_hop = None
-                inv_pool = state.get("inventory_pool") or {}
-                baseline_rts = inv_pool.get("baseline_routes", {}).get(target_node, [])
-                for r in baseline_rts:
-                    if r.get("next_hop") and r.get("destination") == target_subnet:
-                        next_hop = r.get("next_hop")
-                        break
-                if not next_hop:
-                    for r in baseline_rts:
-                        if r.get("next_hop"):
-                            next_hop = r.get("next_hop")
-                            break
-                if not next_hop:
-                    topo = state.get("topology_path", [])
-                    if target_node in topo:
-                        idx = topo.index(target_node)
-                        adj_nodes = []
-                        if idx + 1 < len(topo):
-                            adj_nodes.append(topo[idx + 1])
-                        if idx - 1 >= 0:
-                            adj_nodes.append(topo[idx - 1])
-                        nodes_data = (state.get("baseline") or {}).get("nodes", {})
-                        for adj in adj_nodes:
-                            link_ips = _extract_link_ips(nodes_data, target_node, adj)
-                            if link_ips:
-                                next_hop = link_ips[0]
-                                break
-                if not next_hop:
-                    next_hop = "10.1.12.2"
-
-                if target_kind == "frr":
-                    patch_cmd = f"vtysh -c 'configure terminal' -c 'ip route {target_subnet} {next_hop}'"
-                    rollback_cmd = f"vtysh -c 'configure terminal' -c 'no ip route {target_subnet} {next_hop}'"
-                else:
-                    patch_cmd = f"ip route replace {target_subnet} via {next_hop}"
-                    rollback_cmd = f"ip route del {target_subnet} via {next_hop}"
-
-                diag_report = DiagnosticReport(
-                    telemetry_trigger="Packet drop or route deficit detected",
-                    root_cause=f"Missing static route to {target_subnet} on {target_node}",
-                    affected_nodes=[target_node],
-                    error_category=ErrorCategory.ROUTING_MISCONFIG,
-                    severity=SeverityLevel.HIGH,
-                    confidence_score=0.95,
-                    evidence=[f"5-tuple reachability failure to {target_subnet}"],
-                )
-                remed_plan = RemediationPlan(
-                    action_type=RemediationActionType.EXEC_RUNTIME_COMMAND,
-                    target_entity=target_node,
-                    exec_commands=[patch_cmd],
-                    rollback_steps=[
-                        RollbackStep(
-                            step_order=1,
-                            description=f"Remove added route on {target_node}",
-                            action="EXEC_COMMAND",
-                            target_node=target_node,
-                            payload=rollback_cmd,
-                        )
-                    ],
-                    expected_outcome=f"Traffic to {target_subnet} restored via {next_hop}",
-                    estimated_risk=SeverityLevel.LOW,
-                )
+                    diag_report = DiagnosticReport(
+                        telemetry_trigger="Packet drop or route deficit detected",
+                        root_cause=f"Missing static route to {target_subnet} on {target_node}",
+                        affected_nodes=[target_node],
+                        error_category=ErrorCategory.ROUTING_MISCONFIG,
+                        severity=SeverityLevel.HIGH,
+                        confidence_score=0.95,
+                        evidence=[f"5-tuple reachability failure to {target_subnet}"],
+                    )
+                    remed_plan = RemediationPlan(
+                        action_type=RemediationActionType.EXEC_RUNTIME_COMMAND,
+                        target_entity=target_node,
+                        exec_commands=patch_cmds,
+                        rollback_steps=rollback_steps,
+                        expected_outcome=f"Traffic to {target_subnet} restored via {next_hop}",
+                        estimated_risk=SeverityLevel.LOW,
+                    )
 
         # 4. Explicitly attach iteration counter tags (`step_tag`) to each command
         history = list(state.get("step_tags_history") or [])
@@ -1293,8 +1345,13 @@ def create_operational_nodes(
             "diagnostic_report": diag_report.model_dump(),
             "remediation_plan": plan_dict,
             "retrieved_sop": retrieved_sop,
+            "dual_retrieval_results": dual_retrieval_results,
+            "canonical_intents": [ci.model_dump() for ci in canonical_intents],
+            "compilation_results": [cr.model_dump() for cr in compilation_results],
             "current_step_tag": current_step_tag,
             "step_tags_history": history,
+            "step_tag": current_step_tag,
+            "autonomy_tier": "bounded",
             "circuit_breaker_tripped": False,
             "status": "stage2_plan_generated",
             "execution_logs": [log],
@@ -1324,36 +1381,63 @@ def create_operational_nodes(
             allow_empty=False,
         )
 
-        if sandbox_res.all_passed:
+        # Pre-flight verification in isolated sandbox runtime emitting PreflightSandboxPassReport
+        preflight_report: PreflightSandboxPassReport = ShadowSandboxManager.run_preflight_verification(
+            target_node=target_node,
+            commands=exec_cmds,
+            adapter=lab_adapter,
+            aal=agent_access_layer,
+            step_tag=step_tag,
+            timeout=15,
+            allow_empty=False,
+        )
+
+        clean_pass = (
+            sandbox_res.all_passed
+            and preflight_report.all_passed
+            and preflight_report.verify_clean_pass()
+        )
+
+        if clean_pass:
+            sig_preview = preflight_report.pass_signature[:12] if preflight_report.pass_signature else "valid"
             log = create_log_entry(
                 stage="sandbox_validation",
-                message=f"Shadow sandbox validation PASSED on replica for '{target_node}': patch is safe",
+                message=f"Shadow sandbox validation PASSED on replica for '{target_node}': preflight certified (sig: {sig_preview}...) and safe",
                 level="info",
-                metadata={"sandbox_id": sandbox_res.sandbox_id, "commands_tested": sandbox_res.commands_tested},
+                metadata={
+                    "sandbox_id": sandbox_res.sandbox_id,
+                    "commands_tested": sandbox_res.commands_tested,
+                    "pass_signature": preflight_report.pass_signature,
+                },
             )
             return {
                 "sandbox_result": sandbox_res.model_dump(),
+                "preflight_report": preflight_report.model_dump(),
                 "sandbox_passed": True,
                 "dry_run_passed": True,
+                "autonomy_tier": "full_autonomy",
                 "status": "sandbox_passed",
                 "execution_logs": [log],
             }
         else:
             new_retries = retry_count + 1
+            err_msg = preflight_report.error_message or sandbox_res.error_message or "Sandbox preflight verification failed"
             log = create_log_entry(
                 stage="sandbox_validation",
-                message=f"Shadow sandbox validation FAILED on '{target_node}': {sandbox_res.error_message} (retry {new_retries}/{max_retries})",
+                message=f"Shadow sandbox validation FAILED on '{target_node}': {err_msg} (retry {new_retries}/{max_retries})",
                 level="warning",
-                metadata={"sandbox_id": sandbox_res.sandbox_id, "error": sandbox_res.error_message},
+                metadata={"sandbox_id": sandbox_res.sandbox_id, "error": err_msg},
             )
             return {
                 "sandbox_result": sandbox_res.model_dump(),
+                "preflight_report": preflight_report.model_dump(),
                 "sandbox_passed": False,
                 "dry_run_passed": False,
                 "retry_count": new_retries,
                 "circuit_breaker_tripped": (new_retries >= max_retries),
+                "autonomy_tier": "full_autonomy",
                 "status": "sandbox_failed",
-                "error_message": sandbox_res.error_message,
+                "error_message": err_msg,
                 "execution_logs": [log],
             }
 
@@ -1361,7 +1445,7 @@ def create_operational_nodes(
     # Node 6: Human Approval (HITL Gate)
     # -----------------------------------------------------------------------
     def human_approval_node(state: OperationalState) -> Dict[str, Any]:
-        """Support human approval (HITL) gate only after sandbox validation passes."""
+        """Support human approval (HITL) gate only after verified sandbox pre-flight pass."""
         def _normalize_approval(val: Any) -> Optional[bool]:
             if isinstance(val, bool):
                 return val
@@ -1379,15 +1463,44 @@ def create_operational_nodes(
                     return False
             return None
 
+        # Guardrailed Bounded Autonomy: Require verified PreflightSandboxPassReport before approval
+        preflight_data = state.get("preflight_report")
+        preflight_verified = False
+        if preflight_data:
+            if isinstance(preflight_data, PreflightSandboxPassReport):
+                preflight_verified = preflight_data.all_passed and preflight_data.verify_clean_pass()
+            elif isinstance(preflight_data, dict):
+                try:
+                    rep_obj = PreflightSandboxPassReport.model_validate(preflight_data)
+                    preflight_verified = rep_obj.all_passed and rep_obj.verify_clean_pass()
+                except Exception:
+                    preflight_verified = False
+
+        if not preflight_verified:
+            log = create_log_entry(
+                stage="human_approval",
+                message="Approval BLOCKED: Pre-flight sandbox verification report missing, unverified, or invalid signature. Live deployment denied.",
+                level="warning",
+                metadata={"preflight_verified": False},
+            )
+            return {
+                "human_approved": False,
+                "status": "rejected",
+                "autonomy_tier": "bounded",
+                "error_message": "Blocked: Preflight sandbox pass report is missing or unverified",
+                "execution_logs": [log],
+            }
+
         if auto_approve:
             log = create_log_entry(
                 stage="human_approval",
-                message="Auto-approved: candidate patch cleared for live execution after sandbox validation",
+                message="Auto-approved: candidate patch cleared for live execution after verified sandbox preflight pass",
                 level="info",
             )
             return {
                 "human_approved": True,
                 "status": "approved",
+                "autonomy_tier": "bounded",
                 "execution_logs": [log],
             }
 
@@ -1395,12 +1508,13 @@ def create_operational_nodes(
         if norm is True:
             log = create_log_entry(
                 stage="human_approval",
-                message="Operator approved candidate remediation plan",
+                message="Operator approved candidate remediation plan after verified sandbox preflight pass",
                 level="info",
             )
             return {
                 "human_approved": True,
                 "status": "approved",
+                "autonomy_tier": "bounded",
                 "execution_logs": [log],
             }
         elif norm is False:
@@ -1412,6 +1526,7 @@ def create_operational_nodes(
             return {
                 "human_approved": False,
                 "status": "rejected",
+                "autonomy_tier": "bounded",
                 "execution_logs": [log],
             }
         else:
@@ -1433,6 +1548,7 @@ def create_operational_nodes(
                         return {
                             "human_approved": True,
                             "status": "approved",
+                            "autonomy_tier": "bounded",
                             "execution_logs": [log],
                         }
                     else:
@@ -1444,6 +1560,7 @@ def create_operational_nodes(
                         return {
                             "human_approved": False,
                             "status": "rejected",
+                            "autonomy_tier": "bounded",
                             "execution_logs": [log],
                         }
                 except (EOFError, KeyboardInterrupt):
@@ -1457,6 +1574,7 @@ def create_operational_nodes(
             )
             return {
                 "status": "pending_approval",
+                "autonomy_tier": "bounded",
                 "execution_logs": [log],
             }
 
@@ -1509,6 +1627,7 @@ def create_operational_nodes(
                 "all_ok": all_ok,
                 "results": results,
             },
+            "autonomy_tier": "bounded",
             "status": "patched" if all_ok else "patch_failed",
             "execution_logs": [log],
         }
@@ -1524,6 +1643,7 @@ def create_operational_nodes(
         nodes_data = baseline.get("nodes", {})
         retry_count = state.get("retry_count", 0)
         max_retries = state.get("max_retries", 3)
+        inventory = state.get("inventory_pool") or {}
 
         all_lab_nodes = list(nodes_data.keys()) or topology_path or list(inventory.get("assets", []))
         routers = [
@@ -1605,23 +1725,64 @@ def create_operational_nodes(
             return {
                 "re_verify_results": report_dict,
                 "last_qdisc_stats": updated_qstats or state.get("last_qdisc_stats"),
+                "autonomy_tier": "bounded",
                 "status": "re_verified",
                 "error_message": None,
                 "execution_logs": [log],
             }
         else:
             new_retries = retry_count + 1
+            rollback_steps = (state.get("remediation_plan") or {}).get("rollback_steps") or []
+            rollback_results: List[Dict[str, Any]] = []
+            target = (state.get("remediation_plan") or {}).get("target_entity", "")
+            step_tag = state.get("current_step_tag") or f"diag_iter_{new_retries}"
+
+            if rollback_steps:
+                for idx, step in enumerate(rollback_steps, start=1):
+                    cmd = (
+                        step.get("command") or step.get("payload")
+                        if isinstance(step, dict)
+                        else (getattr(step, "command", None) or getattr(step, "payload", ""))
+                    )
+                    step_node = (
+                        step.get("target_node")
+                        if isinstance(step, dict)
+                        else getattr(step, "target_node", "")
+                    ) or target
+                    if cmd:
+                        rb_tag = f"{step_tag}_rollback_{idx}"
+                        tool_call = AALToolCall(
+                            tool_name="rollback_exec",
+                            node_name=step_node,
+                            command=cmd,
+                            step_tag=rb_tag,
+                            read_only=False,
+                            timeout=15,
+                        )
+                        rb_resp = agent_access_layer.execute(tool_call)
+                        rollback_results.append({
+                            "command": cmd,
+                            "target_node": step_node,
+                            "step_tag": rb_tag,
+                            "exit_code": rb_resp.exit_code,
+                            "success": rb_resp.success,
+                        })
+
             log = create_log_entry(
                 stage="re_verification",
-                message=f"Post-change verification FAILED: {len(report_dict.get('failures', []))} issue(s) remain (retry {new_retries}/{max_retries})",
+                message=f"Post-change verification FAILED: {len(report_dict.get('failures', []))} issue(s) remain (retry {new_retries}/{max_retries}). Automated inverse rollback executed ({len(rollback_results)} commands).",
                 level="warning",
+                metadata={"failures": report_dict.get("failures"), "rollback_results": rollback_results},
             )
             return {
                 "re_verify_results": report_dict,
+                "rollback_executed": True if rollback_results else False,
+                "rollback_results": rollback_results,
                 "retry_count": new_retries,
                 "circuit_breaker_tripped": (new_retries >= max_retries),
+                "autonomy_tier": "bounded",
                 "status": "re_verify_failed",
-                "error_message": f"Verification failures remain: {report_dict.get('failures')}",
+                "error_message": f"Verification failures remain: {report_dict.get('failures')}. Automated rollback executed.",
                 "execution_logs": [log],
             }
 
@@ -1641,6 +1802,8 @@ def create_operational_nodes(
         )
         return {
             "status": "circuit_broken",
+            "circuit_breaker_tripped": True,
+            "autonomy_tier": "bounded",
             "error_message": msg,
             "execution_logs": [log],
         }

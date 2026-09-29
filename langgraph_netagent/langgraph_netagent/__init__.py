@@ -32,6 +32,20 @@ from langgraph_netagent.models import (
     ValidationErrorDetail,
     ValidationResult,
     ValidationSeverity,
+    # Milestone 2 Intent Models
+    CanonicalIntent,
+    CanonicalRemediationIntent,
+    CompilationResult,
+    CompiledRemediationResult,
+    IntentAction,
+    IntentActionType,
+    PlatformType,
+    TargetPlatform,
+    # Milestone 3 Knowledge Models
+    DualRetrievalResult,
+    TreeNode,
+    VectorIndexEntry,
+    VendorDocSource,
 )
 from langgraph_netagent.tools import (
     BaseNetworkLabAdapter,
@@ -60,9 +74,22 @@ from langgraph_netagent.tools import (
     # AAL & Sandbox
     AALSecurityError,
     AgentAccessLayer,
+    AutoGarbageCollector,
+    DockerSandboxRuntime,
+    MockSandboxRuntime,
     ShadowSandboxManager,
     SOPDocument,
     SOPRetriever,
+    create_sandbox_runtime,
+    # Intent Compiler
+    CanonicalIntentCompiler,
+    compile_canonical_intent,
+    compile_remediation_plan,
+    # Milestone 3 Vendor Knowledge & Dual-Retrieval
+    CommandTreeStore,
+    DualRetrievalEngine,
+    LightweightVectorIndex,
+    VendorDocIngestor,
 )
 from langgraph_netagent.models.operational import (
     AALResponse,
@@ -71,6 +98,12 @@ from langgraph_netagent.models.operational import (
     InventoryPool,
     NetworkDiscrepancy,
     ShadowSandboxResult,
+)
+from langgraph_netagent.models.sandbox import (
+    GCReport,
+    PreflightSandboxPassReport,
+    ResourceQuota,
+    SandboxExecutionResult,
 )
 from langgraph_netagent.validation import OfflineValidator
 from langgraph_netagent.workflow import (
@@ -96,6 +129,16 @@ from langgraph_netagent.workflow import (
     create_operational_initial_state,
     create_operational_nodes,
     run_operational_workflow,
+    # Harmonized workflow (Milestone 5)
+    HarmonizedOperationalGraph,
+    HarmonizedGraph,
+    HarmonizedState,
+    HarmonizedOpsState,
+    OperationalPhase,
+    build_harmonized_graph,
+    create_harmonized_initial_state,
+    create_harmonized_nodes,
+    run_harmonized_workflow,
 )
 
 __all__ = [
@@ -178,12 +221,52 @@ __all__ = [
     "AgentAccessLayer",
     "ShadowSandboxManager",
     "ShadowSandboxResult",
+    "DockerSandboxRuntime",
+    "MockSandboxRuntime",
+    "AutoGarbageCollector",
+    "create_sandbox_runtime",
+    "ResourceQuota",
+    "SandboxExecutionResult",
+    "GCReport",
+    "PreflightSandboxPassReport",
     "SOPDocument",
     "SOPRetriever",
+    # Milestone 2 Intent Models & Compiler
+    "IntentAction",
+    "IntentActionType",
+    "TargetPlatform",
+    "PlatformType",
+    "CanonicalIntent",
+    "CanonicalRemediationIntent",
+    "CompilationResult",
+    "CompiledRemediationResult",
+    "CanonicalIntentCompiler",
+    "compile_canonical_intent",
+    "compile_remediation_plan",
+    # Milestone 3 Vendor Knowledge & Dual-Retrieval
+    "TreeNode",
+    "VectorIndexEntry",
+    "DualRetrievalResult",
+    "VendorDocSource",
+    "CommandTreeStore",
+    "LightweightVectorIndex",
+    "VendorDocIngestor",
+    "DualRetrievalEngine",
+    # Operational workflow
     "OperationalState",
     "build_operational_graph",
     "run_operational_workflow",
     "create_operational_initial_state",
     "create_operational_nodes",
+    # Harmonized workflow (Milestone 5)
+    "HarmonizedOperationalGraph",
+    "HarmonizedGraph",
+    "HarmonizedState",
+    "HarmonizedOpsState",
+    "OperationalPhase",
+    "build_harmonized_graph",
+    "run_harmonized_workflow",
+    "create_harmonized_initial_state",
+    "create_harmonized_nodes",
 ]
 

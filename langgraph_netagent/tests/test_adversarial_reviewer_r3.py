@@ -33,7 +33,7 @@ from langgraph_netagent.tools.aal import AgentAccessLayer, AALSecurityError
 from langgraph_netagent.tools.base import CommandResult
 from langgraph_netagent.tools.mock_engine import MockContainerlabAdapter
 from langgraph_netagent.tools.sandbox import ShadowSandboxManager
-from langgraph_netagent.workflow.graph import SimpleMemorySaver
+from langgraph_netagent.workflow.graph import create_memory_saver
 from langgraph_netagent.workflow.operational_edges import (
     route_after_approval,
     route_after_re_verification,
@@ -266,11 +266,11 @@ class TestHumanApprovalGateStress:
         # When unapproved and unrecognized, ends at end_rejected with status pending or rejected
         assert final_state["status"] in ("pending_approval", "rejected")
 
-    def test_checkpoint_pause_at_approval_and_resumption_to_fixed(self):
+    def test_checkpoint_pause_at_approval_and_resumption_to_fixed(self, checkpoint_state):
         """Verify state machine pauses at human_approval with status='pending_approval' and cleanly resumes."""
         llm = MockOperationalLLMProvider(target_node="frr1")
         adapter = MockUMLAdapter(healthy=False, fix_after_patch=True)
-        saver = SimpleMemorySaver()
+        saver = create_memory_saver()
 
         graph = build_operational_graph(
             llm_provider=llm,
@@ -291,7 +291,7 @@ class TestHumanApprovalGateStress:
         assert adapter.patched is False
 
         # Verify state is persisted in checkpointer
-        saved = saver.get(config)
+        saved = checkpoint_state(saver.get(config))
         assert saved is not None
         assert saved["status"] == "pending_approval"
         assert saved.get("remediation_plan") is not None

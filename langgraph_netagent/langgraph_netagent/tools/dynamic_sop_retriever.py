@@ -60,7 +60,8 @@ class DynamicSOPRetriever(SOPRetriever):
         # Use a copy of sops list so mutations don't alter global DEFAULT_SOPS
         initial_sops = list(sops) if sops is not None else list(DEFAULT_SOPS)
         super().__init__(sops=initial_sops, dual_engine=dual_engine)
-        self.scraper = scraper or VendorDocScraper(cache_dir=cache_dir)
+        self._scraper_instance = scraper
+        self._cache_dir = cache_dir
         self._dynamic_sops: List[SOPDocument] = []
         self._scraped_results: List[ScrapedDocResult] = []
 
@@ -70,6 +71,17 @@ class DynamicSOPRetriever(SOPRetriever):
                     self.scrape_and_ingest(url)
                 except Exception as exc:
                     logger.warning("Pre-scrape ingestion failed for %s: %s", url, exc)
+
+    @property
+    def scraper(self) -> VendorDocScraper:
+        """Lazily initialize the VendorDocScraper to avoid early network client creation."""
+        if self._scraper_instance is None:
+            self._scraper_instance = VendorDocScraper(cache_dir=self._cache_dir)
+        return self._scraper_instance
+
+    @scraper.setter
+    def scraper(self, value: VendorDocScraper) -> None:
+        self._scraper_instance = value
 
     @property
     def dynamic_sops(self) -> List[SOPDocument]:

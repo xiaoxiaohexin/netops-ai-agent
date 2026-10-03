@@ -71,6 +71,19 @@ class SimpleMemorySaver:
         return copy.deepcopy(history[-1]) if history else None
 
 
+def create_memory_saver() -> Any:
+    """Return the in-memory checkpointer matching the active graph engine.
+
+    Official ``langgraph`` validates that a checkpointer passed to
+    ``StateGraph.compile`` is a ``BaseCheckpointSaver``, so the lightweight
+    ``SimpleMemorySaver`` is only usable with the built-in ``SimpleStateGraph``.
+    Selecting here keeps callers working on both engines.
+    """
+    if HAS_OFFICIAL_LANGGRAPH and OfficialMemorySaver is not None:
+        return OfficialMemorySaver()
+    return SimpleMemorySaver()
+
+
 class CompiledSimpleGraph:
     """Compiled runnable graph instance produced by SimpleStateGraph."""
 

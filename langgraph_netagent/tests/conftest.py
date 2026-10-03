@@ -354,3 +354,22 @@ commit stay
         ip_allocations=allocations,
     )
 
+
+@pytest.fixture
+def checkpoint_state():
+    """Normalise a checkpointer's stored state into a plain state dict.
+
+    ``SimpleMemorySaver`` stores the state dict directly, while the official
+    ``langgraph`` savers return a ``Checkpoint`` whose state lives under
+    ``channel_values``. This keeps assert/resume logic identical on both engines.
+    """
+
+    def _extract(saved):
+        if saved is None:
+            return None
+        if isinstance(saved, dict):
+            return saved.get("channel_values", saved)
+        return getattr(saved, "channel_values", saved)
+
+    return _extract
+

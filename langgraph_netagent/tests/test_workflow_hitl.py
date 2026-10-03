@@ -14,8 +14,8 @@ from langgraph_netagent.models.intent import NetworkIntent
 from langgraph_netagent.models.topology import FullTopologyPackage
 from langgraph_netagent.tools.mock_engine import MockContainerlabAdapter
 from langgraph_netagent.workflow.graph import (
-    SimpleMemorySaver,
     build_network_agent_graph,
+    create_memory_saver,
     run_network_agent_workflow,
 )
 from langgraph_netagent.workflow.state import create_initial_state
@@ -100,12 +100,13 @@ class TestWorkflowHumanInTheLoop:
         tmp_path: Path,
         sample_network_intent: NetworkIntent,
         sample_topology_package: FullTopologyPackage,
+        checkpoint_state,
     ):
         """Test two-stage flow: graph pauses at human_approval, checkpointer saves, resumes upon approval."""
         mock_llm.register_canned_response(sample_network_intent)
         mock_llm.register_canned_response(sample_topology_package)
 
-        saver = SimpleMemorySaver()
+        saver = create_memory_saver()
         app = build_network_agent_graph(
             llm_provider=mock_llm,
             lab_adapter=mock_adapter,
@@ -129,7 +130,7 @@ class TestWorkflowHumanInTheLoop:
         assert mock_adapter._deployed is False
 
         # Verify state stored in checkpointer
-        saved_checkpoint = saver.get(config)
+        saved_checkpoint = checkpoint_state(saver.get(config))
         assert saved_checkpoint is not None
         assert saved_checkpoint["status"] == "pending_approval"
         assert saved_checkpoint["validated_topology"] is not None

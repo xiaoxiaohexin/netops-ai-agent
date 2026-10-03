@@ -687,7 +687,12 @@ class TestSimpleStateGraphEngineAdversarial:
         mock_llm.register_canned_response(sample_network_intent)
         mock_llm.register_canned_response(sample_topology_package)
 
-        saver = SimpleMemorySaver()
+        try:
+            from langgraph.checkpoint.memory import MemorySaver as OfficialMemorySaver
+            saver = OfficialMemorySaver()
+        except ImportError:
+            saver = SimpleMemorySaver()
+        
         config = {"configurable": {"thread_id": "hitl-session-1"}}
 
         app = build_network_agent_graph(
@@ -707,12 +712,17 @@ class TestSimpleStateGraphEngineAdversarial:
         # Verify state snapshot in checkpointer
         checkpoint = saver.get(config)
         assert checkpoint is not None
-        assert checkpoint["status"] == "pending_approval"
-        assert checkpoint["validated_topology"] is not None
+        # Handle Official langgraph Checkpoint vs Custom SimpleMemorySaver
+        cp_state = checkpoint.get("channel_values", checkpoint) if isinstance(checkpoint, dict) else getattr(checkpoint, "channel_values", checkpoint)
+        assert cp_state["status"] == "pending_approval"
+        assert cp_state["validated_topology"] is not None
 
         # Simulate operator granting approval out-of-band and verifying route resolution
-        checkpoint["human_approved"] = True
-        next_route = route_after_approval(checkpoint)
+        if isinstance(cp_state, dict):
+            cp_state["human_approved"] = True
+        else:
+            setattr(cp_state, "human_approved", True)
+        next_route = route_after_approval(cp_state)
         assert next_route == "deployment"
 
     def test_dangling_edge_target_behavior(self):

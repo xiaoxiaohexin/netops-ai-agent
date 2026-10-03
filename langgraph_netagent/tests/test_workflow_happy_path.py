@@ -22,8 +22,8 @@ from langgraph_netagent.models.intent import (
 from langgraph_netagent.models.topology import FullTopologyPackage
 from langgraph_netagent.tools.mock_engine import MockContainerlabAdapter
 from langgraph_netagent.workflow.graph import (
-    SimpleMemorySaver,
     build_network_agent_graph,
+    create_memory_saver,
     run_network_agent_workflow,
 )
 from langgraph_netagent.workflow.state import create_initial_state
@@ -225,12 +225,13 @@ class TestWorkflowHappyPath:
         tmp_path: Path,
         sample_network_intent: NetworkIntent,
         sample_topology_package: FullTopologyPackage,
+        checkpoint_state,
     ):
-        """Verify execution with SimpleMemorySaver preserves intermediate state."""
+        """Verify execution with a memory checkpointer preserves intermediate state."""
         mock_llm.register_canned_response(sample_network_intent)
         mock_llm.register_canned_response(sample_topology_package)
 
-        saver = SimpleMemorySaver()
+        saver = create_memory_saver()
         app = build_network_agent_graph(
             llm_provider=mock_llm,
             lab_adapter=mock_adapter,
@@ -244,7 +245,7 @@ class TestWorkflowHappyPath:
         final = app.invoke(initial, config=config)
 
         assert final["status"] == "verified"
-        saved = saver.get(config)
+        saved = checkpoint_state(saver.get(config))
         assert saved is not None
         assert saved["status"] == "verified"
         assert saved["parsed_intent"] is not None

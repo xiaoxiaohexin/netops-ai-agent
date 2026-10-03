@@ -61,6 +61,8 @@ class OperationalState(TypedDict):
 
     # 7. Post-Change Re-verification Probing
     re_verify_results: Optional[Dict[str, Any]]
+    rollback_executed: Optional[bool]
+    rollback_results: List[Dict[str, Any]]
 
     # 8. Execution Control & Audit
     retry_count: int
@@ -166,6 +168,8 @@ def create_operational_initial_state(
         "human_approved": None if not auto_approve else True,
         "patch_result": None,
         "re_verify_results": None,
+        "rollback_executed": False,
+        "rollback_results": [],
         "retry_count": 0,
         "max_retries": max_retries,
         "circuit_breaker_tripped": False,
@@ -225,6 +229,8 @@ class OperationalStateModel(BaseModel):
     human_approved: Optional[bool] = None
     patch_result: Optional[Dict[str, Any]] = None
     re_verify_results: Optional[Dict[str, Any]] = None
+    rollback_executed: Optional[bool] = False
+    rollback_results: List[Dict[str, Any]] = Field(default_factory=list)
     retry_count: int = 0
     max_retries: int = 3
     circuit_breaker_tripped: bool = False

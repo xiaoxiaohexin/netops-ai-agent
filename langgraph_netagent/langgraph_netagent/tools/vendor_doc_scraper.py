@@ -262,10 +262,19 @@ class DocFetcher:
         self.backoff_factor = backoff_factor
         self._last_request_time: Dict[str, float] = {}
 
-        if client is not None:
-            self._client = client
-            self._owns_client = False
-        else:
+        self._client = client
+        self._owns_client = client is None
+        self._client_built = client is not None
+
+    @property
+    def client(self) -> httpx.Client:
+        """Lazily build the HTTP client on first use.
+
+        Constructing an ``httpx.Client`` eagerly can raise on hosts with a
+        malformed proxy environment (e.g. a stray ``[::1]`` entry in
+        ``NO_PROXY``), which would otherwise make cache/parse-only usage fail.
+        """
+        if not self._client_built:
             self._client = httpx.Client(
                 timeout=httpx.Timeout(self.timeout),
                 headers={
@@ -275,7 +284,8 @@ class DocFetcher:
                 },
                 follow_redirects=True,
             )
-            self._owns_client = True
+            self._client_built = True
+        return self._client
 
     def _enforce_rate_limit(self, url: str) -> None:
         """Enforce polite minimum delay between requests to the same hostname."""
@@ -306,7 +316,7 @@ class DocFetcher:
         for attempt in range(self.max_retries):
             self._enforce_rate_limit(url)
             try:
-                response = self._client.get(url)
+                response = self.client.get(url)
                 if response.status_code == 200:
                     return response.text
                 elif response.status_code in (429, 500, 502, 503, 504):
@@ -343,7 +353,7 @@ class DocFetcher:
 
     def close(self) -> None:
         """Close underlying HTTP client if owned."""
-        if self._owns_client and self._client:
+        if self._owns_client and self._client_built and self._client:
             self._client.close()
 
     def __enter__(self) -> DocFetcher:

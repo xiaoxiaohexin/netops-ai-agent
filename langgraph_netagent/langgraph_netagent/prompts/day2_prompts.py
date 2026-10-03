@@ -4,6 +4,8 @@ Prompts for live network fault diagnosis and remediation generation,
 designed for Day-2 operations where the topology is already deployed.
 """
 
+from typing import Any, Dict, List, Optional
+
 DAY2_DIAGNOSIS_SYSTEM_PROMPT = """You are a Day-2 Network Operations SRE Agent. Your mission is to analyze live probe failures from a Containerlab network and diagnose the root cause.
 
 Context:
@@ -96,3 +98,92 @@ Return a JSON object with:
 - "analysis": string explaining the reasoning
 - "recommended_checks": list of specific commands to run on each suspect device
 """
+
+DAY2_DYNAMIC_TOPOLOGY_SECTION = """## Discovered Network Topology
+- Routers: {routers}
+- Subnets: {subnets}
+- Virtual IPs (VIPs): {vips}
+- Active Links: {active_links}
+"""
+
+DAY2_DYNAMIC_DIAGNOSIS_USER_PROMPT = """{topology_section}
+
+## Enriched Diagnostic Context
+{enriched_context}
+
+## Retrieved SOP Playbooks
+{sop_playbooks}
+
+## Dual-Retrieval Vendor Knowledge
+{dual_knowledge}
+
+## Telemetry Failures (5-Tuple)
+{failure_5tuples}
+
+## Isolated Discrepancies
+{discrepancies}
+
+Generate an actionable DiagnosticReport and RemediationPlan for target '{target_node}'."""
+
+
+def format_dynamic_topology_prompt(
+    discovered_topology: Any,
+    max_bytes: int = 500,
+) -> str:
+    """Format a concise markdown summary of the discovered network topology within budget.
+
+    Includes summary of router nodes, interface paths/peerings, subnets, and VIPs.
+    """
+    if not discovered_topology:
+        return ""
+
+    routers: List[str] = []
+    subnets: List[str] = []
+    vips: List[str] = []
+    links_summary: List[str] = []
+
+    if hasattr(discovered_topology, "find_router_nodes"):
+        routers = discovered_topology.find_router_nodes()
+        subnets = getattr(discovered_topology, "subnets", [])
+        vips = getattr(discovered_topology, "vips", [])
+        links = getattr(discovered_topology, "links", [])
+        for lnk in links[:4]:
+            l_node = getattr(lnk, "local_node", "")
+            l_iface = getattr(lnk, "local_iface", "")
+            r_node = getattr(lnk, "remote_node", "")
+            r_iface = getattr(lnk, "remote_iface", "")
+            if l_node and r_node:
+                links_summary.append(f"{l_node}:{l_iface}<->{r_node}:{r_iface}")
+    elif isinstance(discovered_topology, dict):
+        routers = discovered_topology.get("routers", []) or [
+            n for n, d in (discovered_topology.get("nodes") or {}).items()
+            if isinstance(d, dict) and d.get("role") in ("router", "egress", "gateway", "leaf", "spine")
+        ]
+        subnets = discovered_topology.get("subnets", [])
+        vips = discovered_topology.get("vips", [])
+        raw_links = discovered_topology.get("links", [])
+        for lnk in raw_links[:4]:
+            if isinstance(lnk, dict):
+                ep = lnk.get("endpoints", [])
+                if len(ep) >= 2:
+                    links_summary.append(f"{ep[0]}<->{ep[1]}")
+                elif "local_node" in lnk and "remote_node" in lnk:
+                    links_summary.append(f"{lnk['local_node']}:{lnk.get('local_iface', '')}<->{lnk['remote_node']}:{lnk.get('remote_iface', '')}")
+
+    lines = [
+        "## Discovered Network Topology",
+        f"- Routers: {', '.join(routers[:6]) if routers else 'none'}",
+        f"- Subnets: {', '.join(subnets[:6]) if subnets else 'none'}",
+    ]
+    if vips:
+        lines.append(f"- Virtual IPs (VIPs): {', '.join(vips[:4])}")
+    if links_summary:
+        lines.append(f"- Active Links: {', '.join(links_summary[:4])}")
+
+    result = "\n".join(lines)
+    encoded = result.encode("utf-8")
+    if len(encoded) > max_bytes:
+        truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        return truncated.rsplit("\n", 1)[0]
+    return result
+

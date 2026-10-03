@@ -1,127 +1,118 @@
-# 项目逻辑梳理（Project Logic）
+# Project: netops-ai-agent Dynamic Topology Discovery & Scraped Knowledge Base Refactoring
 
-> 本文如实描述 `netops-ai-agent` 当前的代码结构与执行链路，替换了此前带营销成分的架构文档。目标是「看清代码现在是什么」，而不是「它想成为什么」。
-
----
-
-## 1. 这是什么
-
-一个 Python（LangGraph 状态机）编写的**闭环自愈网络运维 Agent 研究原型**。它面向 **Containerlab 容器实验网**（或宿主机网卡），演示：
-
-```
-感知（遥测探针） → 诊断（规则分类） → 有界修复（沙箱预演 + HITL） → 复测 → 回滚 / 熔断
-```
-
-核心定位：**验证"有界自治"的工程形态**，而非可交付生产的网管系统。
-
----
-
-## 2. 代码库的演进与分层（真实现状）
-
-代码是**多轮迭代叠加**的结果，三条工作流并存，而非单一干净架构：
-
-| 工作流 | 文件 | 入口 | 现状 |
-|---|---|---|---|
-| Greenfield（8 节点） | `workflow/graph.py`、`workflow/nodes.py` | `--topo-only` | 最早版本；从零「意图→拓扑→部署→自愈」，CLI 已标注 DEPRECATED |
-| Operational（Day-2） | `workflow/operational_graph.py`、`workflow/operational_nodes.py` | 默认路径 | 当前主用；对**已在运行的网络**做排障自愈 |
-| Harmonized（Day-1/2/3） | `workflow/harmonized_graph.py` | `--harmonized` | 当前主用；统一三阶段，带相位校验 |
-
-CLI 实际分发逻辑（`cli.py`）：
-
-- 默认 → `run_operational_workflow`
-- `--harmonized` → `run_harmonized_workflow`
-- `--topo-only` → 旧 greenfield 导出（弃用）
-- `--day2` → **已定义但未使用**（死标志）
-- `-it` / `--scan` → 独立于工作流，走交互式 / 资产扫描
+## Architecture
+Decouple netops-ai-agent from static topology assumptions and hardcoded SOP playbooks by implementing runtime-driven network diagnosis:
+1. **Dynamic Topology Engine (`tools/topology_discovery.py`)**:
+   - Parses Containerlab `.clab.yml` files (supporting `defaults.kind`, `nodes`, `links`, `group`, `ports`, `mtu`, `env`, `exec`, `binds`).
+   - Extracts embedded configs (IPs in `env:`, `exec:` commands like `ip addr add`, DHCP pools, NAT VIPs).
+   - Resolves RFC 1918 subnets (fixing the 172.16.x.x filtering bug).
+   - Builds `DiscoveredTopology` graph with subnet indexing, longest-prefix matching (LPM), interface-to-peer links, and role classification.
+2. **Dynamic Knowledge Base & Scraper (`tools/vendor_doc_scraper.py` & `tools/dynamic_sop_retriever.py`)**:
+   - Fetches live vendor documentation (FRR Sphinx docs, Cisco command reference tables, Arista EOS docs) via `httpx` and `BeautifulSoup`.
+   - Extracts command syntax, parameters, verification commands, and troubleshooting workflows.
+   - Manages SHA-256 persistent disk caching with TTL for offline/air-gapped resilience and sub-millisecond query performance.
+   - Automatically generates inverse rollback commands (`no <command>`, etc.).
+   - Feeds into `CommandTreeStore` and `LightweightVectorIndex`, preserving the `<500B` prompt budget.
+3. **Refactored Day-2 Operational Workflow (`workflow/operational_nodes.py` & `operational_state.py`)**:
+   - Extends `OperationalState` with `discovered_topology`, `scraped_sops`, and `runtime_incident_context`.
+   - Eliminates all 13 hardcoded IPs (`192.168.100.2`, `203.0.113.10`, `10.1.12.2`, `10.2.2.0/24`) and router names (`dc-egress`, `frr1`) from `operational_nodes.py`.
+   - Resolves bottleneck nodes, offending client IPs, victim VIPs, and routing deficits dynamically from the graph.
+   - Injects runtime topology and scraped knowledge into Day-2 LLM diagnostic prompts.
+4. **Verification & Hardening Pipeline (`tests/`)**:
+   - Programmatic topology discovery test with `clos5_dhcp.yml`.
+   - Grep verification ensuring zero hardcoded IPs/node names in `workflow/*.py`.
+   - Programmatic web scraping test against vendor URLs.
+   - End-to-end Containerlab diagnostic test with dynamic context.
+   - 100% zero-regression across all 973 existing tests.
 
 ---
 
-## 3. 真实执行链路（Operational / Harmonized）
-
-以 Operational 工作流为例，逐步说明每步**实际做了什么**：
-
-1. **基线摄取（baseline_ingestion）**：`clab inspect --format json` + `docker exec` 读取运行中节点的 IP/资产清单，构建 `InventoryPool`。
-2. **遥测与五元组提取（telemetry_extraction）**：真实执行 `ping`、`vtysh show ip route`、`tc -s qdisc show`、`ip -s link show`，解析出失败五元组与差异项。
-3. **异常分类（classify_anomaly）**：**纯规则**，四类 —— 外部过载 / 单出口故障 / 内链路故障 / 健康。含大量针对 Clos5 的写死默认值。
-4. **两阶段诊断（diagnostic_stage1 / stage2）**：
-   - Stage 1：经 AAL 只读执行，拉取 running-config / 路由表 / qdisc，推断 RAG 关键词。
-   - Stage 2：检索 SOP 模板，生成 Canonical Intent（如 `DROP_TRAFFIC` / `RESTORE_ROUTE` / `RESET_INTERFACE`），编译为平台命令；LLM 仅用于生成 `DiagnosticReport`/`RemediationPlan` 文案，**失败则走确定性回退**。
-5. **沙箱预演（sandbox_validation）**：`docker commit` 克隆目标节点 → `docker run --network none --privileged` 起隔离副本 → 在副本执行补丁命令 → 清理。mock 模式下改为克隆虚拟节点。
-6. **HITL 审批（human_approval）**：必须有沙箱预演通过报告才允许审批（`--auto-approve` 自动通过，或交互式 `[y/N]`）。
-7. **实弹热补丁（live_hot_patch）**：经 AAL 逐条 `docker exec` 执行补丁命令，带 step_tag。
-8. **复测与回滚（re_verification）**：重新探测；失败则执行逆序回滚命令，重试超限 → 熔断。
-
----
-
-## 4. 各模块的真实职责
-
-| 模块 | 文件 | 实际职责 |
-|---|---|---|
-| 数据契约 | `models/` | Pydantic 模型（意图、拓扑、诊断、遥测、意图、知识、沙箱报告） |
-| 网络适配 | `tools/clab_adapter.py` | 真实执行 `clab deploy/destroy/inspect` + `docker exec`（Windows 走 WSL2） |
-| 遥测探针 | `tools/probes.py` | ping / 路由表 / 接口 / qdisc 采集与解析 |
-| 访问控制层 | `tools/aal.py` | **正则黑名单** + 只读约束 + CLI 输出归一化 |
-| 沙箱 | `tools/sandbox.py`、`tools/sandbox_runtime.py` | docker commit 克隆 + 试跑 + 清理（含 mock 回退） |
-| 意图编译 | `tools/intent_compiler.py` | 生成 Linux iptables / FRR / Cisco ACL / Huawei VRP **文本命令** + 逆序回滚 |
-| 知识检索 | `tools/sop_retriever.py`、`tools/vendor_knowledge.py` | ~10 条硬编码 SOP + 手工模板树，关键词重叠检索 |
-| 环境探测 | `tools/detector.py`、`tools/nic_adapter.py` | 探测 OS/WSL/Docker/Containerlab；挂载宿主机网卡 |
-| LLM 抽象 | `llm/` | provider 接口；`mock`（罐头）/ `qwen` / `openai` / `vllm` / `ollama` |
-| 工作流 | `workflow/` | 三条工作流的节点 / 边 / 状态 |
+## Feature Inventory
+| # | Feature | Description | Milestone | Source |
+|---|---------|-------------|-----------|--------|
+| F1 | Containerlab Full Schema Parser | Parse YAML files supporting `topology.defaults`, custom kinds, link MTUs, groups, and ports | M1 | explorer_survey_3_1 |
+| F2 | Static Configuration Extractor | Extract declared IPs and subnets from `env` (e.g. `HOSTNET`), `exec` commands, and binds | M1 | explorer_survey_3_1 |
+| F3 | DiscoveredTopology Graph Model | Graph data model holding nodes, links, IP-to-node index, subnet-to-nodes LPM index, and peer maps | M1 | explorer_survey_3_1 |
+| F4 | RFC 1918 172.16.x.x Subnet Fix | Fix filtering in `_extract_data_ips` so valid data plane subnets in `172.16.0.0/12` are preserved | M1 | explorer_survey_3_1 |
+| F5 | Topology Query & Routing Helpers | Provide programmatic helper methods for role detection, gateway lookup, and adjacent peer resolution | M1 | explorer_survey_3_1 |
+| F6 | Resilient HTTP Document Fetcher | Fetch vendor docs with polite headers, rate limiting, and exponential retry backoff | M2 | spec_miner_survey_3_2 |
+| F7 | Multi-Vendor HTML Parsers | DOM parsers for FRR Sphinx (`<dl class="cli">`), Cisco tables, and Arista EOS references | M2 | spec_miner_survey_3_2 |
+| F8 | Syntax & Troubleshooting Extractor | Extract command syntax, descriptions, parameters, and troubleshooting step sequences | M2 | spec_miner_survey_3_2 |
+| F9 | SHA-256 Persistent Local Caching | Cache scraped documentation locally by URL hash with TTL for air-gapped / offline execution | M2 | spec_miner_survey_3_2 |
+| F10 | Automated Rollback Generator | Synthesize inverse compensation commands (`no <cmd>`, `del`, etc.) for scraped actions | M2 | spec_miner_survey_3_2 |
+| F11 | Dynamic SOP Retriever Integration | Feed scraped SOPs into `CommandTreeStore` and vector index preserving `<500B` prompt budget | M2 | spec_miner_survey_3_2 |
+| F12 | OperationalState Schema Extension | Add `discovered_topology`, `scraped_sops`, and `runtime_incident_context` to `OperationalState` | M3 | explorer_survey_3_3 |
+| F13 | Baseline Ingestion Dynamic Topology | Populate `discovered_topology` in `baseline_ingestion_node` via `TopologyDiscoverer` | M3 | explorer_survey_3_3 |
+| F14 | Operational Nodes Hardcode Removal | Replace all 13 hardcoded IPs, subnets, and node names in `operational_nodes.py` with graph lookups | M3 | explorer_survey_3_3 |
+| F15 | LLM Prompt Dynamic Context Injection | Inject discovered topology and scraped SOPs into `diagnostic_stage1` and `stage2` prompts | M3 | explorer_survey_3_3 |
+| F16 | Programmatic Topology Discovery Test | Test taking `clos5_dhcp.yml` and outputting nodes, links, and IPs without lookup tables | M1, M4 | explorer_survey_3_3 |
+| F17 | Zero-Hardcoding Grep Audit Suite | Programmatic scanner asserting zero hardcoded IPs/node names in `workflow/*.py` | M4 | explorer_survey_3_3 |
+| F18 | Web Scraping Programmatic Test | Test accepting FRR/Cisco doc URLs and verifying syntax and troubleshooting extraction | M2, M4 | explorer_survey_3_3 |
+| F19 | Containerlab E2E Diagnostic Test | Diagnostic test verifying anomaly diagnosis succeeds using dynamic topology and scraped SOPs | M4 | explorer_survey_3_3 |
+| F20 | Regression Suite Verification | Validate 100% pass across all 973 existing tests in `langgraph_netagent` | M4 | explorer_survey_3_3 |
 
 ---
 
-## 5. 已知局限（诚实清单）
-
-1. **诊断是规则，不是模型**：`classify_anomaly` 为 if/else 硬编码分类，覆盖异常类型很窄（过载 / 缺路由 / 接口 down / ping 丢包）。
-2. **修复模板绑定特定 lab**：代码中大量写死 Clos5 的 IP / 节点名（`192.168.100.2`、`203.0.113.10`、`dc-egress`、`10.1.12.2`、`10.2.2.0/24`），换网络需改代码。
-3. **AAL 是正则黑名单**：可被混淆绕过，非 OS 级安全边界。
-4. **沙箱含 `--privileged`**：有网络隔离（`--network none`），但并非强隔离；「pass 签名」仅为本地哈希，非可信证明。
-5. **无真实设备下发通道**：Cisco / Huawei 只生成文本命令，没有 SSH / NETCONF / gNMI 传输层，无法真正下发到物理设备。
-6. **默认无真实 AI**：`--provider mock` 是罐头回复；真实推理需自行接模型。
-7. **知识库非实时 RAG**：SOP 与厂商模板为手工维护，非文档摄取。
-8. **`--day2` 为死标志**，`--topo-only` 为弃用路径，CLI 存在历史遗留。
+## Milestones
+| # | Name | Scope | Dependencies | Status |
+|---|------|-------|-------------|--------|
+| M1 | Dynamic Topology Discovery Engine | Implement Containerlab YAML parser, static config extraction, `DiscoveredTopology` model, 172.16 fix, and topology discovery test (`test_topology_discovery.py`) | none | DONE |
+| M2 | Dynamic Knowledge Base & Web Scraper | Implement `DocFetcher`, `DocCacheManager`, vendor HTML parsers, rollback generator, `DynamicSOPRetriever`, and scraper test (`test_vendor_scraper.py`) | none | DONE |
+| M3 | Workflow Refactoring & Context Injection | Extend `OperationalState`, eliminate 13 hardcoded instances in `operational_nodes.py`, inject dynamic topology & scraped SOPs into LLM prompts | M1, M2 | DONE |
+| M4 | Verification, Audit & Zero Regression | Execute topology test, grep scanner (`test_no_hardcoded_topology.py`), scraper test, Containerlab E2E diagnostic test, and 100% regression validation | M3 | DONE |
 
 ---
 
-## 6. 关键数据流
+## Interface Contracts
 
-```
-用户意图 / 运行中 lab
-        │
-        ▼
-[baseline_ingestion] ── clab inspect + docker exec ──► InventoryPool / baseline
-        │
-        ▼
-[telemetry_extraction] ── ping/vtysh/tc/ip ──► NetworkHealthReport + FiveTuple + Discrepancy
-        │
-        ▼
-[classify_anomaly] ── 规则 ──► AnomalyClassification
-        │
-        ▼
-[diagnostic_stage1] ── AAL 只读 ──► enriched_context + rag_keywords
-        │
-        ▼
-[diagnostic_stage2] ── SOP 检索 + 意图编译 +（可选）LLM ──► RemediationPlan + rollback_steps
-        │
-        ▼
-[sandbox_validation] ── docker commit 克隆试跑 ──► PreflightSandboxPassReport
-        │
-        ▼
-[human_approval] ── 需通过报告 ──► approved / rejected
-        │
-        ▼
-[live_hot_patch] ── AAL docker exec ──► patch_result
-        │
-        ▼
-[re_verification] ── 复测 ──► re_verified / 回滚 / circuit_breaker
-```
+### Topology Engine ↔ Workflow
+- **Module**: `langgraph_netagent/tools/topology_discovery.py`
+- **Class**: `TopologyDiscoverer`
+- **Methods**:
+  ```python
+  def discover_from_yaml(self, yaml_path: Union[str, Path]) -> DiscoveredTopology: ...
+  def discover_from_runtime(self, yaml_path: Optional[Union[str, Path]] = None) -> DiscoveredTopology: ...
+  ```
+- **Data Structure (`models/topology.py` or `models/discovered_topology.py`)**:
+  ```python
+  class DiscoveredTopology(BaseModel):
+      name: str
+      nodes: Dict[str, DiscoveredNode]
+      links: List[DiscoveredLink]
+      ip_to_node: Dict[str, str]
+      subnet_to_nodes: Dict[str, List[str]]
+      subnets: List[str]
+      node_roles: Dict[str, str]  # router, egress, host, etc.
+      def find_node_by_ip(self, ip: str) -> Optional[str]: ...
+      def find_gateway_for_subnet(self, subnet: str) -> Optional[str]: ...
+      def find_router_nodes(self) -> List[str]: ...
+      def find_peer_interfaces(self, node: str) -> Dict[str, Tuple[str, str]]: ...
+  ```
+
+### Web Scraper ↔ Knowledge Base & Workflow
+- **Module**: `langgraph_netagent/tools/vendor_doc_scraper.py`
+- **Classes**: `DocFetcher`, `DocCacheManager`, `VendorDocScraper`
+- **Methods**:
+  ```python
+  def scrape_vendor_doc(url: str, force_refresh: bool = False) -> ScrapedDocResult: ...
+  def extract_troubleshooting_steps(soup: BeautifulSoup, vendor: str) -> List[TroubleshootingStep]: ...
+  def extract_command_syntaxes(soup: BeautifulSoup, vendor: str) -> List[CommandSyntax]: ...
+  ```
+- **Integration**:
+  `DynamicSOPRetriever` subclasses or wraps `SOPRetriever`, accepting dynamically scraped SOPs while maintaining the `retrieve(keywords, limit)` and `retrieve_dual(query, limit)` signatures and formatting output within `<500B`.
 
 ---
 
-## 7. 如果目标是生产网络，还缺什么
-
-- 真实设备接入（SSH / NETCONF / gNMI）与凭证管理
-- 通用拓扑抽象，去掉写死 IP / 节点名
-- 真实 LLM 推理 + 结构化输出强校验 + 人工确认
-- 最小权限沙箱（去 `--privileged`）、命令 allowlist、审计入库
-- 配置基线 / 版本快照、变更窗口、逐设备 diff
+## Code Layout
+- `langgraph_netagent/langgraph_netagent/models/topology.py`: Containerlab schema updates (`topology.defaults`, custom kinds, etc.)
+- `langgraph_netagent/langgraph_netagent/models/discovered_topology.py`: `DiscoveredTopology`, `DiscoveredNode`, `DiscoveredLink`
+- `langgraph_netagent/langgraph_netagent/tools/topology_discovery.py`: Standalone dynamic topology discovery engine
+- `langgraph_netagent/langgraph_netagent/tools/vendor_doc_scraper.py`: Real-time web scraping module, DOM parsers, cache manager
+- `langgraph_netagent/langgraph_netagent/tools/dynamic_sop_retriever.py`: SOP integration layer bridging scraper with dual retrieval
+- `langgraph_netagent/langgraph_netagent/workflow/operational_state.py`: Enhanced state with `discovered_topology` and `scraped_sops`
+- `langgraph_netagent/langgraph_netagent/workflow/operational_nodes.py`: Refactored nodes without hardcoded IPs/names
+- `langgraph_netagent/langgraph_netagent/prompts/day2_prompts.py`: Enhanced prompts with dynamic topology and runtime context
+- `langgraph_netagent/tests/test_topology_discovery.py`: Test taking `clos5_dhcp.yml` and testing programmatic topology extraction
+- `langgraph_netagent/tests/test_vendor_scraper.py`: Test scraping vendor doc URLs and extracting syntax/troubleshooting
+- `langgraph_netagent/tests/test_no_hardcoded_topology.py`: Grep scanner test verifying absence of hardcoded IPs/names in workflow
+- `langgraph_netagent/tests/test_e2e_dynamic_workflow.py`: End-to-end Containerlab diagnostic verification test

@@ -7,62 +7,117 @@ from __future__ import annotations
 import ipaddress
 import re
 from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import yaml
+
+from langgraph_netagent.models.discovered_topology import (
+    DiscoveredInterface,
+    DiscoveredLink,
+    DiscoveredNode,
+    DiscoveredTopology,
+)
 
 
 class ContainerlabMgmtConfig(BaseModel):
     """Management network configuration in Containerlab."""
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     network: str = Field(default="clab", description="Docker network name for management")
     ipv4_subnet: Optional[str] = Field(default="172.100.100.0/24", alias="ipv4-subnet", description="Management IPv4 subnet CIDR")
     ipv6_subnet: Optional[str] = Field(default=None, alias="ipv6-subnet", description="Management IPv6 subnet CIDR")
+    mtu: Optional[int] = Field(default=None, description="Management network MTU")
+
+
+class ContainerlabDefaultsConfig(BaseModel):
+    """Default node settings applied to nodes in Containerlab topology."""
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    kind: Optional[str] = Field(default=None, description="Default node kind")
+    image: Optional[str] = Field(default=None, description="Default container image")
+    group: Optional[str] = Field(default=None, description="Default node group")
+    env: Dict[str, Any] = Field(default_factory=dict, description="Default environment variables")
+    exec: List[Union[str, int]] = Field(default_factory=list, description="Default execution commands")
+    binds: List[str] = Field(default_factory=list, description="Default volume mounts")
+    ports: List[Union[str, int]] = Field(default_factory=list, description="Default port mappings")
+    sysctls: Dict[str, Union[int, str]] = Field(default_factory=dict, description="Default sysctls")
 
 
 class ContainerlabNodeConfig(BaseModel):
     """Node configuration entry in Containerlab topology."""
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
-    kind: str = Field(..., description="Node kind ('linux', 'nokia_srlinux', 'cisco_xrv', etc.)")
-    image: str = Field(..., description="Container image ('alpine:latest', 'frrouting/frr:latest', etc.)")
+    kind: Optional[str] = Field(default="linux", description="Node kind ('linux', 'nokia_srlinux', 'cisco_xrv', etc.)")
+    image: Optional[str] = Field(default="", description="Container image ('alpine:latest', 'frrouting/frr:latest', etc.)")
+    group: Optional[str] = Field(default=None, description="Node group or tier ('leaf', 'spine', 'server', etc.)")
+    ports: List[Union[str, int]] = Field(default_factory=list, description="Port mappings (e.g. ['8008:8008'])")
     binds: List[str] = Field(default_factory=list, description="Host-to-container volume mount mappings")
-    exec: List[str] = Field(default_factory=list, description="Post-boot execution commands")
+    exec: List[Union[str, int]] = Field(default_factory=list, description="Post-boot execution commands")
     sysctls: Dict[str, Union[int, str]] = Field(default_factory=dict, description="Kernel sysctl parameters")
     startup_config: Optional[str] = Field(default=None, alias="startup-config", description="Path to startup configuration file")
-    env: Dict[str, str] = Field(default_factory=dict, description="Environment variables")
+    env: Dict[str, Any] = Field(default_factory=dict, description="Environment variables")
     labels: Dict[str, str] = Field(default_factory=dict, description="Custom metadata labels")
 
 
 class ContainerlabLinkEndpoint(BaseModel):
     """Inter-node link endpoint pair in Containerlab."""
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     endpoints: List[str] = Field(..., description="List of two endpoints in 'node:interface' format")
+    mtu: Optional[int] = Field(default=None, description="Link MTU")
 
-    @field_validator("endpoints")
+    @field_validator("endpoints", mode="before")
     @classmethod
-    def validate_endpoints_pair(cls, v: List[str]) -> List[str]:
-        if len(v) != 2:
-            raise ValueError(f"Link must connect exactly 2 endpoints, got {len(v)}: {v}")
+    def validate_endpoints_pair(cls, v: Any) -> List[str]:
+        if not isinstance(v, list) or len(v) != 2:
+            raise ValueError(f"Link must connect exactly 2 endpoints, got {len(v) if isinstance(v, list) else v}: {v}")
+        normalized: List[str] = []
         endpoint_pattern = re.compile(r"^[a-zA-Z0-9_\-]+:[a-zA-Z0-9_\.\-]+$")
         for ep in v:
-            if not endpoint_pattern.match(ep):
-                raise ValueError(f"Endpoint '{ep}' does not match required format '<node>:<interface>' (e.g. 'pc1:eth1')")
-        return v
+            if isinstance(ep, dict):
+                node = ep.get("node")
+                iface = ep.get("interface") or ep.get("iface")
+                if not node or not iface:
+                    raise ValueError(f"Dict endpoint must contain 'node' and 'interface', got: {ep}")
+                ep_str = f"{node}:{iface}"
+            elif isinstance(ep, str):
+                ep_str = ep
+            else:
+                raise ValueError(f"Endpoint must be string or dict, got {type(ep)}")
+
+            if not endpoint_pattern.match(ep_str):
+                raise ValueError(f"Endpoint '{ep_str}' does not match required format '<node>:<interface>' (e.g. 'pc1:eth1')")
+            normalized.append(ep_str)
+        return normalized
 
 
 class ContainerlabTopologyDefinition(BaseModel):
-    """Inner topology dictionary holding nodes and links."""
-    model_config = ConfigDict(populate_by_name=True)
+    """Inner topology dictionary holding nodes, defaults, and links."""
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
+    defaults: Optional[Union[ContainerlabDefaultsConfig, Dict[str, Any]]] = Field(
+        default=None, description="Global defaults applied to child nodes"
+    )
     nodes: Dict[str, ContainerlabNodeConfig] = Field(..., description="Dictionary of node definitions keyed by node name")
     links: List[ContainerlabLinkEndpoint] = Field(default_factory=list, description="List of link endpoint connections")
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_defaults_to_nodes(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            defaults = data.get("defaults")
+            nodes = data.get("nodes")
+            if isinstance(defaults, dict) and isinstance(nodes, dict):
+                def_kind = defaults.get("kind")
+                for node_name, node_cfg in nodes.items():
+                    if isinstance(node_cfg, dict):
+                        if def_kind and "kind" not in node_cfg:
+                            node_cfg["kind"] = def_kind
+        return data
 
 
 class ContainerlabTopologyFile(BaseModel):
     """Complete root Containerlab topology YAML file schema."""
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     name: str = Field(..., min_length=1, description="Lab topology name identifier")
     mgmt: Optional[ContainerlabMgmtConfig] = Field(default=None, description="Management network settings")

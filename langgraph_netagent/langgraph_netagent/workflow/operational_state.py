@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import operator
 from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Annotated, TypedDict
 
 from langgraph_netagent.workflow.day2_state import LogEntry, create_log_entry
@@ -90,6 +91,11 @@ class OperationalState(TypedDict):
     phase_history: Optional[List[str]]
     vendor_knowledge_indexed: Optional[bool]
     dual_retrieval_index_built: Optional[bool]
+
+    # 12. Dynamic Runtime Discovery & Dynamic SOPs (Requirement R1, R2, R3)
+    discovered_topology: Optional[Any]
+    scraped_sops: Optional[List[Any]]
+    runtime_incident_context: Optional[Dict[str, Any]]
 
 
 def create_operational_initial_state(
@@ -182,5 +188,69 @@ def create_operational_initial_state(
         "phase_history": ["day1"],
         "vendor_knowledge_indexed": False,
         "dual_retrieval_index_built": False,
+        "discovered_topology": None,
+        "scraped_sops": [],
+        "runtime_incident_context": {},
     }
+
+
+class OperationalStateModel(BaseModel):
+    """Pydantic model equivalent of OperationalState for schema validation and serialization."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    baseline: Optional[Dict[str, Any]] = None
+    inventory_pool: Optional[Dict[str, Any]] = None
+    topology_path: Optional[List[str]] = None
+    node_kinds: Optional[Dict[str, str]] = None
+    initial_alerts: List[str] = Field(default_factory=list)
+    telemetry_results: Optional[Dict[str, Any]] = None
+    probe_results: Optional[Dict[str, Any]] = None
+    failure_5tuples: List[Dict[str, Any]] = Field(default_factory=list)
+    discrepancies: List[Dict[str, Any]] = Field(default_factory=list)
+    suspect_devices: List[str] = Field(default_factory=list)
+    affected_segments: List[Dict[str, Any]] = Field(default_factory=list)
+    anomaly_classification: Optional[Dict[str, Any]] = None
+    last_qdisc_stats: Optional[Dict[str, Any]] = None
+    enriched_context: Optional[Dict[str, Any]] = None
+    rag_keywords: List[str] = Field(default_factory=list)
+    retrieved_sop: List[Dict[str, Any]] = Field(default_factory=list)
+    diagnostic_report: Optional[Dict[str, Any]] = None
+    remediation_plan: Optional[Dict[str, Any]] = None
+    step_tags_history: List[str] = Field(default_factory=list)
+    current_step_tag: Optional[str] = None
+    sandbox_result: Optional[Dict[str, Any]] = None
+    sandbox_passed: Optional[bool] = None
+    dry_run_passed: Optional[bool] = None
+    human_approved: Optional[bool] = None
+    patch_result: Optional[Dict[str, Any]] = None
+    re_verify_results: Optional[Dict[str, Any]] = None
+    retry_count: int = 0
+    max_retries: int = 3
+    circuit_breaker_tripped: bool = False
+    status: str = "initialized"
+    error_message: Optional[str] = None
+    execution_logs: List[Any] = Field(default_factory=list)
+    watch_mode: Optional[bool] = False
+    watch_interval: Optional[float] = 5.0
+    watch_cycle: Optional[int] = 0
+    max_watch_cycles: Optional[int] = None
+    last_healthy_timestamp: Optional[str] = None
+    consecutive_healthy_cycles: Optional[int] = 0
+    canonical_intents: List[Any] = Field(default_factory=list)
+    compilation_results: List[Any] = Field(default_factory=list)
+    preflight_report: Optional[Any] = None
+    dual_retrieval_results: List[Any] = Field(default_factory=list)
+    autonomy_tier: str = "bounded"
+    step_tag: str = ""
+    operational_phase: Optional[str] = "day1"
+    phase_history: List[str] = Field(default_factory=lambda: ["day1"])
+    vendor_knowledge_indexed: Optional[bool] = False
+    dual_retrieval_index_built: Optional[bool] = False
+
+    # Dynamic Discovery and SOPs (Requirement R1, R2, R3)
+    discovered_topology: Optional[Any] = None
+    scraped_sops: List[Any] = Field(default_factory=list)
+    runtime_incident_context: Dict[str, Any] = Field(default_factory=dict)
+
 

@@ -19,10 +19,13 @@ import copy
 from datetime import datetime, timezone
 import ipaddress
 import json
+import logging
 import re
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from langgraph_netagent.llm.base import BaseLLMProvider, ChatMessage
 from langgraph_netagent.models.diagnostic import DiagnosticReport, ErrorCategory, SeverityLevel
@@ -47,18 +50,28 @@ from langgraph_netagent.models.remediation import (
     RemediationPlan,
     RollbackStep,
 )
+from langgraph_netagent.models.discovered_topology import (
+    DiscoveredInterface,
+    DiscoveredLink,
+    DiscoveredNode,
+    DiscoveredTopology,
+)
 from langgraph_netagent.models.telemetry import NetworkHealthReport
 from langgraph_netagent.prompts.day2_prompts import (
     DAY2_DIAGNOSIS_SYSTEM_PROMPT,
     DAY2_REMEDIATION_SYSTEM_PROMPT,
+    format_dynamic_topology_prompt,
 )
 from langgraph_netagent.tools.aal import AgentAccessLayer
 from langgraph_netagent.tools.base import BaseNetworkLabAdapter
 from langgraph_netagent.tools.baseline import BaselineCollector
+from langgraph_netagent.tools.dynamic_sop_retriever import DynamicSOPRetriever
 from langgraph_netagent.tools.intent_compiler import CanonicalIntentCompiler
 from langgraph_netagent.tools.probes import NetworkTelemetryCollector, PingProbe
 from langgraph_netagent.tools.sandbox import ShadowSandboxManager
 from langgraph_netagent.tools.sop_retriever import SOPRetriever
+from langgraph_netagent.tools.topology_discovery import TopologyDiscoverer
+from langgraph_netagent.tools.vendor_doc_scraper import ScrapedDocResult
 from langgraph_netagent.workflow.operational_edges import route_after_healthy
 from langgraph_netagent.workflow.operational_state import (
     OperationalState,
@@ -72,6 +85,7 @@ def classify_anomaly(
     discrepancies: Optional[List[NetworkDiscrepancy | Dict[str, Any]]] = None,
     failure_5tuples: Optional[List[FiveTuple | Dict[str, Any]]] = None,
     inventory: Optional[Dict[str, Any]] = None,
+    discovered_topology: Optional[Any] = None,
 ) -> AnomalyClassification:
     """Classify detected network anomalies into operational root-cause categories.
 
@@ -84,6 +98,16 @@ def classify_anomaly(
     discrepancies_list = discrepancies or []
     failure_5tuples_list = failure_5tuples or []
     inventory_dict = inventory or {}
+
+    discovered_topo_obj: Optional[DiscoveredTopology] = None
+    if discovered_topology is not None:
+        if isinstance(discovered_topology, DiscoveredTopology):
+            discovered_topo_obj = discovered_topology
+        elif isinstance(discovered_topology, dict):
+            try:
+                discovered_topo_obj = DiscoveredTopology(**discovered_topology)
+            except Exception:
+                discovered_topo_obj = None
 
     def _get_disc(d: Any, key: str, default: Any = None) -> Any:
         if isinstance(d, dict):
@@ -174,13 +198,113 @@ def classify_anomaly(
                 bottleneck_iface = _get_disc(disc_over, "affected_interface")
 
         if not bottleneck_node:
-            bottleneck_node = "dc-egress"
+            # Dynamic resolution: node with highest drop count in qdisc_stats
+            if qdisc_stats:
+                max_drops = -1
+                drop_node = None
+                for n, q_list in qdisc_stats.items():
+                    total_d = sum(_get_disc(q, "dropped", 0) + _get_disc(q, "overlimits", 0) for q in q_list)
+                    if total_d > max_drops and total_d > 0:
+                        max_drops = total_d
+                        drop_node = n
+                if drop_node:
+                    bottleneck_node = drop_node
+
+        if not bottleneck_node and discovered_topo_obj:
+            # Query egress / gateway / border role from discovered topology
+            egress_candidates = [
+                n for n, r in discovered_topo_obj.node_roles.items()
+                if r.lower() in ("egress", "gateway", "border")
+            ]
+            if egress_candidates:
+                bottleneck_node = egress_candidates[0]
+            else:
+                routers = discovered_topo_obj.find_router_nodes()
+                if routers:
+                    bottleneck_node = routers[0]
+
+        if not bottleneck_node and inventory_dict:
+            routers = inventory_dict.get("routers", [])
+            if routers:
+                bottleneck_node = routers[0]
+            elif inventory_dict.get("assets"):
+                bottleneck_node = inventory_dict["assets"][0]
+
+        if not bottleneck_node:
+            bottleneck_node = "router"
+
         if not bottleneck_iface:
-            bottleneck_iface = "eth2"
+            # Highest drops interface for bottleneck_node
+            if bottleneck_node and bottleneck_node in qdisc_stats:
+                best_iface = None
+                max_drops = -1
+                for q in qdisc_stats[bottleneck_node]:
+                    d = _get_disc(q, "dropped", 0) + _get_disc(q, "overlimits", 0)
+                    if d > max_drops:
+                        max_drops = d
+                        best_iface = _get_disc(q, "interface")
+                if best_iface:
+                    bottleneck_iface = best_iface
+
+        if not bottleneck_iface and discovered_topo_obj and bottleneck_node in discovered_topo_obj.nodes:
+            # First non-mgmt interface on bottleneck_node
+            node_obj = discovered_topo_obj.nodes[bottleneck_node]
+            for if_name, if_obj in node_obj.interfaces.items():
+                if not if_obj.is_mgmt:
+                    bottleneck_iface = if_name
+                    break
+
+        if not bottleneck_iface:
+            bottleneck_iface = "eth1"
+
         if not src:
-            src = "192.168.100.2"
+            for f in failure_5tuples_list:
+                s = _get_5t(f, "source_ip")
+                if s and s not in ("0.0.0.0", "unknown"):
+                    src = s
+                    break
+
+        if not src and discovered_topo_obj:
+            for n_name, n_obj in discovered_topo_obj.nodes.items():
+                if n_obj.role.lower() in ("attacker", "client") or (n_obj.group and n_obj.group.lower() in ("attacker", "client")):
+                    if n_obj.ips:
+                        src = n_obj.ips[0].split("/")[0]
+                        break
+            if not src and discovered_topo_obj.hosts:
+                h_node = discovered_topo_obj.nodes.get(discovered_topo_obj.hosts[0])
+                if h_node and h_node.ips:
+                    src = h_node.ips[0].split("/")[0]
+
+        if not src and inventory_dict.get("ip_to_node"):
+            src = next(iter(inventory_dict["ip_to_node"]), "10.0.0.1")
+
+        if not src:
+            src = "10.0.0.1"
+
         if not dst:
-            dst = "203.0.113.10"
+            for f in failure_5tuples_list:
+                d = _get_5t(f, "destination_ip")
+                if d and d not in ("0.0.0.0", "unknown"):
+                    dst = d
+                    break
+
+        if not dst and discovered_topo_obj and discovered_topo_obj.vips:
+            dst = discovered_topo_obj.vips[0]
+
+        if not dst and inventory_dict.get("vips"):
+            dst = inventory_dict["vips"][0]
+
+        if not dst and discovered_topo_obj:
+            for n_name, n_obj in discovered_topo_obj.nodes.items():
+                if n_obj.role.lower() in ("server", "victim") and n_obj.ips:
+                    dst = n_obj.ips[0].split("/")[0]
+                    break
+
+        if not dst and inventory_dict.get("ip_to_node"):
+            dst = list(inventory_dict["ip_to_node"].keys())[-1]
+
+        if not dst:
+            dst = "10.0.0.2"
 
         return AnomalyClassification(
             category="external_overload",
@@ -199,7 +323,16 @@ def classify_anomaly(
             (d for d in discrepancies_list if _get_disc(d, "discrepancy_type") in ("missing_route", "single_exit_failure", "interface_down")),
             None,
         )
-        b_node = _get_disc(missing_d, "node") if missing_d else "router"
+        b_node = _get_disc(missing_d, "node") if missing_d else None
+        if not b_node:
+            if discovered_topo_obj:
+                r_nodes = discovered_topo_obj.find_router_nodes()
+                b_node = r_nodes[0] if r_nodes else "router"
+            elif inventory_dict.get("routers"):
+                b_node = inventory_dict["routers"][0]
+            else:
+                b_node = "router"
+
         b_iface = _get_disc(missing_d, "affected_interface") if missing_d else None
         target_dst = _get_disc(missing_d, "target_destination") if missing_d else None
 
@@ -255,12 +388,13 @@ def create_operational_nodes(
     auto_approve: bool = False,
     aal: Optional[AgentAccessLayer] = None,
     sop_retriever: Optional[SOPRetriever] = None,
+    retriever: Optional[SOPRetriever] = None,
     clone_timeout: int = 60,
     interactive: bool = False,
 ) -> Dict[str, Callable[[OperationalState], Dict[str, Any]]]:
     """Factory creating all discrete node callables for the operational workflow."""
     agent_access_layer = aal or AgentAccessLayer(lab_adapter=lab_adapter)
-    retriever = sop_retriever or SOPRetriever()
+    retriever = retriever or sop_retriever or DynamicSOPRetriever()
 
     # -----------------------------------------------------------------------
     # Node 1: Baseline Ingestion
@@ -291,24 +425,124 @@ def create_operational_nodes(
                     "inventory_pool": cached_inv if isinstance(cached_inv, dict) else cached_inv.model_dump(),
                     "topology_path": state.get("topology_path") or cached_base.get("topology_path", assets),
                     "node_kinds": state.get("node_kinds") or cached_base.get("node_kinds", {}),
+                    "discovered_topology": state.get("discovered_topology"),
                     "status": "baseline_ingested",
                     "error_message": None,
                     "execution_logs": [log],
                 }
 
-            baseline = BaselineCollector.collect(
-                adapter=lab_adapter,
-                lab_name=lab_name,
+            # 1. Dynamic Topology Discovery from YAML and/or Runtime
+            discovered_topo: Optional[DiscoveredTopology] = None
+            if state.get("discovered_topology"):
+                raw_disc = state["discovered_topology"]
+                if isinstance(raw_disc, DiscoveredTopology):
+                    discovered_topo = raw_disc
+                elif isinstance(raw_disc, dict):
+                    try:
+                        discovered_topo = DiscoveredTopology(**raw_disc)
+                    except Exception:
+                        discovered_topo = None
+
+            topo_file_candidate = (
+                state.get("topology_file")
+                or state.get("clab_path")
+                or getattr(lab_adapter, "last_deployed_topology", None)
+                or getattr(lab_adapter, "topology_file", None)
             )
-            # If inspection failed or nodes empty in mock mode, attempt to load default mock lab
-            if not baseline.get("nodes") and hasattr(lab_adapter, "mock_engine"):
+
+            if not discovered_topo and not topo_file_candidate:
+                from pathlib import Path
+                proj_root = Path(__file__).resolve().parent.parent.parent.parent
+                clos5_file = proj_root / "clos5_dhcp.yml"
+                if (lab_name == "clos5" or state.get("lab_name") == "clos5") and clos5_file.exists():
+                    topo_file_candidate = str(clos5_file)
+
+            if not discovered_topo and topo_file_candidate:
+                discoverer = TopologyDiscoverer()
+                try:
+                    discovered_topo = discoverer.discover_from_yaml(topo_file_candidate)
+                    if lab_adapter and hasattr(lab_adapter, "inspect"):
+                        try:
+                            discovered_topo = discoverer.discover_from_runtime(
+                                adapter=lab_adapter, yaml_path=topo_file_candidate
+                            )
+                        except Exception:
+                            pass
+                except Exception as disc_err:
+                    logger.warning("Dynamic topology discovery from %s encountered: %s", topo_file_candidate, disc_err)
+
+            # 2. Collect baseline from adapter if available
+            baseline = {}
+            if lab_adapter:
+                try:
+                    baseline = BaselineCollector.collect(
+                        adapter=lab_adapter,
+                        lab_name=lab_name,
+                    )
+                except Exception:
+                    baseline = {}
+
+            # If inspection failed or nodes empty in mock mode, attempt to load default mock lab if no discovered_topo
+            if not baseline.get("nodes") and hasattr(lab_adapter, "mock_engine") and not discovered_topo:
                 from pathlib import Path
                 default_clab = Path(__file__).resolve().parent.parent.parent / "clab_output" / "netagent-lab.clab.yml"
                 if default_clab.exists():
                     lab_adapter.deploy(default_clab)
                     baseline = BaselineCollector.collect(adapter=lab_adapter, lab_name=lab_name)
 
-            inventory_pool = InventoryPool.from_baseline(baseline)
+            # 3. Formulate inventory_pool from baseline or discovered_topology
+            if baseline.get("nodes"):
+                inventory_pool = InventoryPool.from_baseline(baseline)
+                if discovered_topo:
+                    inv_dict = inventory_pool.model_dump()
+                    if discovered_topo.vips:
+                        inv_dict["vips"] = list(discovered_topo.vips)
+                    for sn in discovered_topo.subnets:
+                        if sn not in inv_dict.get("subnets", []):
+                            inv_dict.setdefault("subnets", []).append(sn)
+                    inventory_pool = InventoryPool(**inv_dict)
+            elif discovered_topo:
+                assets = list(discovered_topo.nodes.keys())
+                subnets = list(discovered_topo.subnets)
+                ip_to_node = dict(discovered_topo.ip_to_node)
+                vips = list(discovered_topo.vips)
+                routers = discovered_topo.find_router_nodes()
+                inventory_pool = InventoryPool(
+                    assets=assets,
+                    subnets=subnets,
+                    ip_to_node=ip_to_node,
+                    vips=vips,
+                    routers=routers,
+                )
+                if not baseline:
+                    baseline = {
+                        "lab_name": discovered_topo.name,
+                        "nodes": {
+                            name: {
+                                "name": name,
+                                "kind": node.kind,
+                                "ip_addr": "\n".join(f"inet {ip} dev {if_name}" for if_name, if_obj in node.interfaces.items() for ip in if_obj.ipv4_addresses),
+                                "routes": "",
+                                "running_config": "",
+                            }
+                            for name, node in discovered_topo.nodes.items()
+                        },
+                        "topology_path": getattr(discovered_topo, "topology_paths", [assets])[0] if getattr(discovered_topo, "topology_paths", None) else assets,
+                        "node_kinds": {n: node.kind for n, node in discovered_topo.nodes.items()},
+                    }
+            else:
+                inventory_pool = InventoryPool.from_baseline(baseline or {"nodes": {}})
+
+            topo_path = (
+                state.get("topology_path")
+                or baseline.get("topology_path")
+                or (getattr(discovered_topo, "topology_paths", [None])[0] if getattr(discovered_topo, "topology_paths", None) else inventory_pool.assets)
+            )
+            node_kinds = (
+                state.get("node_kinds")
+                or baseline.get("node_kinds")
+                or ({n: node.kind for n, node in discovered_topo.nodes.items()} if discovered_topo else {})
+            )
 
             node_count = len(inventory_pool.assets)
             log = create_log_entry(
@@ -318,14 +552,16 @@ def create_operational_nodes(
                 metadata={
                     "assets": inventory_pool.assets,
                     "subnets": inventory_pool.subnets,
+                    "has_discovered_topology": discovered_topo is not None,
                 },
             )
 
             return {
                 "baseline": baseline,
                 "inventory_pool": inventory_pool.model_dump(),
-                "topology_path": baseline.get("topology_path", inventory_pool.assets),
-                "node_kinds": baseline.get("node_kinds", {}),
+                "topology_path": topo_path,
+                "node_kinds": node_kinds,
+                "discovered_topology": discovered_topo.model_dump() if discovered_topo else None,
                 "status": "baseline_ingested",
                 "error_message": None,
                 "execution_logs": [log],
@@ -353,18 +589,46 @@ def create_operational_nodes(
         inventory = state.get("inventory_pool") or {}
         nodes_data = baseline.get("nodes", {})
 
+        discovered_topo_raw = state.get("discovered_topology")
+        discovered_topo_obj: Optional[DiscoveredTopology] = None
+        if discovered_topo_raw is not None:
+            if isinstance(discovered_topo_raw, DiscoveredTopology):
+                discovered_topo_obj = discovered_topo_raw
+            elif isinstance(discovered_topo_raw, dict):
+                try:
+                    discovered_topo_obj = DiscoveredTopology(**discovered_topo_raw)
+                except Exception:
+                    discovered_topo_obj = None
+
         all_lab_nodes = list(nodes_data.keys()) or topology_path or list(inventory.get("assets", []))
-        routers = [
-            n for n in all_lab_nodes
-            if node_kinds.get(n) in ("frr", "srl", "router", "gateway", "switch")
-            or any(k in n.lower() for k in ("router", "gw", "egress", "spine", "leaf", "switch", "core", "frr", "srl"))
-        ]
-        pcs = [
-            n for n in all_lab_nodes
-            if node_kinds.get(n) == "linux"
-            and n not in routers
-            and not any(k in n.lower() for k in ("attacker", "rt", "collector", "sflow", "bot"))
-        ]
+        if discovered_topo_obj and not all_lab_nodes:
+            all_lab_nodes = list(discovered_topo_obj.nodes.keys())
+
+        if discovered_topo_obj:
+            discovered_routers = discovered_topo_obj.find_router_nodes()
+            routers = [n for n in all_lab_nodes if n in discovered_routers] or discovered_routers or [
+                n for n in all_lab_nodes
+                if node_kinds.get(n) in ("frr", "srl", "router", "gateway", "switch")
+                or any(k in n.lower() for k in ("router", "gw", "egress", "spine", "leaf", "switch", "core", "frr", "srl"))
+            ]
+            pcs = [n for n in all_lab_nodes if n in discovered_topo_obj.hosts and not any(k in n.lower() for k in ("attacker", "rt", "collector", "sflow", "bot"))] or [
+                n for n in all_lab_nodes
+                if node_kinds.get(n) == "linux"
+                and n not in routers
+                and not any(k in n.lower() for k in ("attacker", "rt", "collector", "sflow", "bot"))
+            ]
+        else:
+            routers = [
+                n for n in all_lab_nodes
+                if node_kinds.get(n) in ("frr", "srl", "router", "gateway", "switch")
+                or any(k in n.lower() for k in ("router", "gw", "egress", "spine", "leaf", "switch", "core", "frr", "srl"))
+            ]
+            pcs = [
+                n for n in all_lab_nodes
+                if node_kinds.get(n) == "linux"
+                and n not in routers
+                and not any(k in n.lower() for k in ("attacker", "rt", "collector", "sflow", "bot"))
+            ]
 
         # 1. Build ping probe matrix targets (PC -> PC)
         ping_targets: List[Tuple[str, str]] = []
@@ -512,27 +776,49 @@ def create_operational_nodes(
                     if s and s not in ("0.0.0.0", "unknown"):
                         src_ip = s
                         break
-            if not src_ip and "attacker" in nodes_data:
-                att_ips = _extract_data_ips(nodes_data.get("attacker", {}))
-                if att_ips:
-                    src_ip = att_ips[0]
+            if not src_ip and discovered_topo_obj:
+                for n_name, n_obj in discovered_topo_obj.nodes.items():
+                    if n_obj.role.lower() in ("attacker", "client") or (n_obj.group and n_obj.group.lower() in ("attacker", "client")):
+                        if n_obj.ips:
+                            src_ip = n_obj.ips[0].split("/")[0]
+                            break
+                if not src_ip and discovered_topo_obj.hosts:
+                    h_node = discovered_topo_obj.nodes.get(discovered_topo_obj.hosts[0])
+                    if h_node and h_node.ips:
+                        src_ip = h_node.ips[0].split("/")[0]
             if not src_ip:
-                for sn in inventory.get("subnets", []):
-                    if sn.startswith("192.168.100."):
-                        src_ip = "192.168.100.2"
+                for n_name, n_data in nodes_data.items():
+                    if any(k in n_name.lower() for k in ("attacker", "client", "host", "ext", "traffic")):
+                        att_ips = _extract_data_ips(n_data)
+                        if att_ips:
+                            src_ip = att_ips[0]
+                            break
+            if not src_ip and inventory.get("ip_to_node"):
+                for ip_str, n_name in inventory["ip_to_node"].items():
+                    if n_name in pcs or not any(r in n_name.lower() for r in ("router", "switch", "spine", "leaf", "egress")):
+                        src_ip = ip_str
                         break
             if not src_ip:
-                src_ip = "192.168.100.2"
+                src_ip = next(iter(inventory.get("ip_to_node", {})), "10.0.0.1")
 
             if not dst_ip:
-                b_ips = _extract_data_ips(nodes_data.get(b_node, {}))
-                vips = [ip for ip, n in inventory.get("ip_to_node", {}).items() if ip.startswith("203.0.113.") and not ip.endswith(".1") and not ip.endswith(".2")]
-                if vips:
-                    dst_ip = vips[0]
-                elif b_ips:
-                    dst_ip = b_ips[0]
+                if discovered_topo_obj and discovered_topo_obj.vips:
+                    dst_ip = discovered_topo_obj.vips[0]
+                elif inventory.get("vips"):
+                    dst_ip = inventory["vips"][0]
                 else:
-                    dst_ip = "203.0.113.10"
+                    b_ips = _extract_data_ips(nodes_data.get(b_node, {}))
+                    if b_ips:
+                        dst_ip = b_ips[0]
+                    elif discovered_topo_obj:
+                        for n_name, n_obj in discovered_topo_obj.nodes.items():
+                            if n_obj.role.lower() in ("server", "victim") and n_obj.ips:
+                                dst_ip = n_obj.ips[0].split("/")[0]
+                                break
+                    if not dst_ip and inventory.get("ip_to_node"):
+                        dst_ip = list(inventory["ip_to_node"].keys())[-1]
+                    if not dst_ip:
+                        dst_ip = "10.0.0.2"
 
             ft_overload = FiveTuple.from_traffic_overload(
                 src_ip=src_ip,
@@ -718,6 +1004,7 @@ def create_operational_nodes(
             discrepancies=obj_discrepancies,
             failure_5tuples=obj_5tuples,
             inventory=inventory,
+            discovered_topology=state.get("discovered_topology"),
         )
 
         all_ok = (
@@ -938,13 +1225,54 @@ def create_operational_nodes(
                 "execution_logs": [log],
             }
 
-        # 2. Retrieve Dual Knowledge & SOP Playbook context
+        # Ingest dynamic scraped SOPs from state into retriever if present
+        scraped_sops = state.get("scraped_sops") or []
+        if scraped_sops and isinstance(retriever, DynamicSOPRetriever):
+            for sop_item in scraped_sops:
+                try:
+                    if isinstance(sop_item, ScrapedDocResult):
+                        retriever.ingest_scraped_result(sop_item)
+                    elif isinstance(sop_item, SOPDocument):
+                        retriever.add_sop(sop_item)
+                    elif isinstance(sop_item, dict):
+                        if "commands" in sop_item:
+                            scraped_res = ScrapedDocResult(**sop_item)
+                            retriever.ingest_scraped_result(scraped_res)
+                        elif "id" in sop_item:
+                            retriever.add_sop(SOPDocument(**sop_item))
+                except Exception as e:
+                    logger.debug("Could not ingest dynamic sop: %s", e)
+
+        # 2. Retrieve Dual Knowledge & SOP Playbook context with <500B ceiling
         query_str = " ".join(rag_keywords) if rag_keywords else "network troubleshooting"
         dual_results = retriever.retrieve_dual(query=query_str, limit=3)
         dual_retrieval_results = [r.model_dump() if hasattr(r, "model_dump") else r for r in dual_results]
         retrieved_sop = retriever.retrieve(keywords=rag_keywords, limit=2)
-        sop_markdown = retriever.format_sop_markdown(retrieved_sop)
-        dual_markdown = retriever.format_dual_markdown(dual_results) if dual_results else ""
+        if isinstance(retriever, DynamicSOPRetriever):
+            sop_markdown = retriever.format_sop_markdown(retrieved_sop, max_bytes=500)
+            dual_markdown = retriever.format_dual_markdown(dual_results, max_bytes=500) if dual_results else ""
+        else:
+            try:
+                sop_markdown = retriever.format_sop_markdown(retrieved_sop, max_bytes=500)
+            except TypeError:
+                sop_markdown = retriever.format_sop_markdown(retrieved_sop)
+            try:
+                dual_markdown = retriever.format_dual_markdown(dual_results, max_bytes=500) if dual_results else ""
+            except TypeError:
+                dual_markdown = retriever.format_dual_markdown(dual_results) if dual_results else ""
+
+        discovered_topo_raw = state.get("discovered_topology")
+        discovered_topo_obj: Optional[DiscoveredTopology] = None
+        if discovered_topo_raw is not None:
+            if isinstance(discovered_topo_raw, DiscoveredTopology):
+                discovered_topo_obj = discovered_topo_raw
+            elif isinstance(discovered_topo_raw, dict):
+                try:
+                    discovered_topo_obj = DiscoveredTopology(**discovered_topo_raw)
+                except Exception:
+                    discovered_topo_obj = None
+
+        topo_summary = format_dynamic_topology_prompt(discovered_topo_obj, max_bytes=500) if discovered_topo_obj else ""
 
         is_overload = (
             anomaly_category == "external_overload"
@@ -964,14 +1292,23 @@ def create_operational_nodes(
             if b_cand and any(cand in b_cand.lower() for cand in ("egress", "router", "gw", "gateway")):
                 target_node = b_cand
 
+            if not target_node and discovered_topo_obj:
+                egress_candidates = [
+                    n for n, r in discovered_topo_obj.node_roles.items()
+                    if r.lower() in ("egress", "gateway", "border")
+                ]
+                if egress_candidates:
+                    target_node = egress_candidates[0]
+                else:
+                    routers = discovered_topo_obj.find_router_nodes()
+                    if routers:
+                        target_node = routers[0]
+
             if not target_node:
                 topo_nodes = state.get("topology_path") or []
-                for cand in ["dc-egress", "egress", "ext-router", "router"]:
-                    for n in topo_nodes:
-                        if cand in n.lower():
-                            target_node = n
-                            break
-                    if target_node:
+                for n in topo_nodes:
+                    if any(cand in n.lower() for cand in ("egress", "gateway", "router", "gw")):
+                        target_node = n
                         break
 
             if not target_node:
@@ -986,7 +1323,14 @@ def create_operational_nodes(
                     or next((disc.get("node") for disc in discrepancies if disc.get("discrepancy_type") == "buffer_overlimit" and disc.get("node")), None)
                 )
             if not target_node:
-                target_node = suspects[0] if suspects else "dc-egress"
+                if suspects:
+                    target_node = suspects[0]
+                elif discovered_topo_obj and discovered_topo_obj.find_router_nodes():
+                    target_node = discovered_topo_obj.find_router_nodes()[0]
+                elif state.get("topology_path"):
+                    target_node = state["topology_path"][0]
+                else:
+                    target_node = "router"
 
             target_kind = state.get("node_kinds", {}).get(target_node, "linux")
 
@@ -1002,8 +1346,15 @@ def create_operational_nodes(
                     if d.get("metadata", {}).get("offending_source_ip"):
                         offending_source_ip = d.get("metadata", {}).get("offending_source_ip")
                         break
+            if not offending_source_ip and discovered_topo_obj:
+                for n_name, n_obj in discovered_topo_obj.nodes.items():
+                    if n_obj.role.lower() in ("attacker", "client") and n_obj.ips:
+                        offending_source_ip = n_obj.ips[0].split("/")[0]
+                        break
+            if not offending_source_ip and inventory.get("ip_to_node"):
+                offending_source_ip = next(iter(inventory["ip_to_node"]), "10.0.0.1")
             if not offending_source_ip:
-                offending_source_ip = "192.168.100.2"
+                offending_source_ip = "10.0.0.1"
 
             victim_destination_ip = anomaly_classification.get("victim_destination_ip")
             proto = None
@@ -1062,14 +1413,30 @@ def create_operational_nodes(
             # Subnet-level perimeter containment against dynamic IP rotation/aliasing
             offending_subnet = None
             if offending_source_ip:
-                for sn in inventory.get("subnets", []):
-                    sn_clean = sn.split("/")[0]
-                    prefix_3 = sn_clean.rsplit(".", 1)[0]
-                    if sn.startswith("192.168.100.") or offending_source_ip.startswith(prefix_3 + "."):
-                        offending_subnet = sn if "/" in sn else f"{sn}/24"
-                        break
-                if not offending_subnet and offending_source_ip.startswith("192.168.100."):
-                    offending_subnet = "192.168.100.0/24"
+                all_subnets = []
+                if discovered_topo_obj:
+                    all_subnets.extend(discovered_topo_obj.subnets)
+                if inventory.get("subnets"):
+                    all_subnets.extend(inventory["subnets"])
+
+                try:
+                    src_addr = ipaddress.ip_address(offending_source_ip)
+                    for sn in all_subnets:
+                        try:
+                            net = ipaddress.ip_network(sn, strict=False)
+                            if src_addr in net and net.prefixlen >= 16:
+                                offending_subnet = str(net)
+                                break
+                        except ValueError:
+                            continue
+                except ValueError:
+                    pass
+
+                if not offending_subnet:
+                    try:
+                        offending_subnet = str(ipaddress.IPv4Network(f"{offending_source_ip}/24", strict=False))
+                    except ValueError:
+                        offending_subnet = f"{offending_source_ip}/32"
 
             if offending_subnet:
                 canonical_intents.append(
@@ -1089,14 +1456,18 @@ def create_operational_nodes(
             diag_report = None
             remed_plan = None
 
-            prompt = (
-                f"## Enriched Diagnostic Context\n{json.dumps(enriched, indent=2)}\n\n"
-                f"## Retrieved SOP Playbooks\n{sop_markdown}\n\n"
-                f"## Dual-Retrieval Vendor Knowledge\n{dual_markdown}\n\n"
-                f"## Failures (5-Tuple)\n{json.dumps(failure_5tuples)}\n\n"
-                f"## Discrepancies\n{json.dumps(discrepancies)}\n\n"
-                f"Generate an actionable DiagnosticReport and RemediationPlan for target '{target_node}' to mitigate traffic overload via iptables."
-            )
+            prompt_parts = []
+            if topo_summary:
+                prompt_parts.append(topo_summary)
+            prompt_parts.extend([
+                f"## Enriched Diagnostic Context\n{json.dumps(enriched, indent=2)}",
+                f"## Retrieved SOP Playbooks\n{sop_markdown}",
+                f"## Dual-Retrieval Vendor Knowledge\n{dual_markdown}",
+                f"## Failures (5-Tuple)\n{json.dumps(failure_5tuples)}",
+                f"## Discrepancies\n{json.dumps(discrepancies)}",
+                f"Generate an actionable DiagnosticReport and RemediationPlan for target '{target_node}' to mitigate traffic overload via iptables.",
+            ])
+            prompt = "\n\n".join(prompt_parts)
             try:
                 messages = [
                     ChatMessage(role="system", content=DAY2_DIAGNOSIS_SYSTEM_PROMPT),
@@ -1169,7 +1540,18 @@ def create_operational_nodes(
                         break
 
             if not target_node:
-                target_node = suspects[0] if suspects else "frr1"
+                if suspects:
+                    target_node = suspects[0]
+                elif discovered_topo_obj:
+                    r_nodes = discovered_topo_obj.find_router_nodes()
+                    target_node = r_nodes[0] if r_nodes else list(discovered_topo_obj.nodes.keys())[0]
+                elif state.get("node_kinds"):
+                    target_node = next(
+                        (n for n, k in state["node_kinds"].items() if k in ("frr", "srl", "router")),
+                        list(state["node_kinds"].keys())[0],
+                    )
+                else:
+                    target_node = "router"
 
             target_kind = state.get("node_kinds", {}).get(target_node, "frr")
             target_disc = next((d for d in discrepancies if d.get("node") == target_node), {})
@@ -1187,13 +1569,34 @@ def create_operational_nodes(
                     )
                 )
             else:
-                target_subnet = "10.2.2.0/24"
+                target_subnet = None
                 for disc in discrepancies:
                     if disc.get("target_destination"):
                         target_subnet = disc.get("target_destination")
                         break
+                if not target_subnet:
+                    for f in failure_5tuples:
+                        if f.get("destination_ip"):
+                            dst_raw = f.get("destination_ip")
+                            try:
+                                target_subnet = str(ipaddress.IPv4Network(f"{dst_raw}/24", strict=False))
+                            except ValueError:
+                                target_subnet = dst_raw
+                            break
+                if not target_subnet and discovered_topo_obj and discovered_topo_obj.subnets:
+                    target_subnets = discovered_topo_obj.get_node_subnets(target_node)
+                    for sn in discovered_topo_obj.subnets:
+                        if sn not in target_subnets:
+                            target_subnet = sn
+                            break
+                    if not target_subnet:
+                        target_subnet = discovered_topo_obj.subnets[0]
+                if not target_subnet and inventory.get("subnets"):
+                    target_subnet = inventory["subnets"][0]
+                if not target_subnet:
+                    target_subnet = "10.0.0.0/24"
 
-                # Derive intelligent next-hop from baseline routes or topology path
+                # Derive intelligent next-hop from baseline routes, topology discovery, or topology path
                 next_hop = None
                 inv_pool = state.get("inventory_pool") or {}
                 baseline_rts = inv_pool.get("baseline_routes", {}).get(target_node, [])
@@ -1206,6 +1609,12 @@ def create_operational_nodes(
                         if r.get("next_hop"):
                             next_hop = r.get("next_hop")
                             break
+
+                # Dynamic next-hop resolution using graph traversal in discovered_topology
+                if not next_hop and discovered_topo_obj and target_subnet:
+                    clean_dst = target_subnet.split("/")[0]
+                    next_hop = discovered_topo_obj.resolve_next_hop(target_node, clean_dst)
+
                 if not next_hop:
                     topo = state.get("topology_path") or []
                     if target_node in topo:
@@ -1221,8 +1630,18 @@ def create_operational_nodes(
                             if link_ips:
                                 next_hop = link_ips[0]
                                 break
+
+                if not next_hop and discovered_topo_obj:
+                    peers = discovered_topo_obj.find_peer_interfaces(target_node)
+                    for local_iface, (peer_node, peer_iface) in peers.items():
+                        if peer_node in discovered_topo_obj.nodes:
+                            p_node = discovered_topo_obj.nodes[peer_node]
+                            if peer_iface in p_node.interfaces and p_node.interfaces[peer_iface].ipv4_addresses:
+                                next_hop = p_node.interfaces[peer_iface].ipv4_addresses[0].split("/")[0]
+                                break
+
                 if not next_hop:
-                    next_hop = "10.1.12.2"
+                    next_hop = "10.0.0.1"
 
                 canonical_intents.append(
                     CanonicalIntent(
@@ -1240,14 +1659,18 @@ def create_operational_nodes(
             compilation_results = compiler.compile_plan(canonical_intents)
 
             # Formulate diagnosis and remediation plan via LLM or deterministic fallback
-            prompt = (
-                f"## Enriched Diagnostic Context\n{json.dumps(enriched, indent=2)}\n\n"
-                f"## Retrieved SOP Playbooks\n{sop_markdown}\n\n"
-                f"## Dual-Retrieval Vendor Knowledge\n{dual_markdown}\n\n"
-                f"## Failures (5-Tuple)\n{json.dumps(failure_5tuples)}\n\n"
-                f"## Discrepancies\n{json.dumps(discrepancies)}\n\n"
-                f"Generate an actionable DiagnosticReport and RemediationPlan for target '{target_node}'."
-            )
+            prompt_parts = []
+            if topo_summary:
+                prompt_parts.append(topo_summary)
+            prompt_parts.extend([
+                f"## Enriched Diagnostic Context\n{json.dumps(enriched, indent=2)}",
+                f"## Retrieved SOP Playbooks\n{sop_markdown}",
+                f"## Dual-Retrieval Vendor Knowledge\n{dual_markdown}",
+                f"## Failures (5-Tuple)\n{json.dumps(failure_5tuples)}",
+                f"## Discrepancies\n{json.dumps(discrepancies)}",
+                f"Generate an actionable DiagnosticReport and RemediationPlan for target '{target_node}'.",
+            ])
+            prompt = "\n\n".join(prompt_parts)
 
             prev_error = state.get("error_message")
             prev_sandbox = state.get("sandbox_result")
@@ -1812,7 +2235,7 @@ def create_operational_nodes(
         """Terminal or loopback node when network is fully healthy."""
         current_cycle = (state.get("watch_cycle") or 0) + 1
         consecutive_healthy = (state.get("consecutive_healthy_cycles") or 0) + 1
-        now_ts = datetime.now(timezone.utc).isoformat()
+        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         # Temporary state to test routing decision with incremented cycle
         temp_state = dict(state)
@@ -1897,7 +2320,7 @@ def create_operational_nodes(
             "execution_logs": [log],
         }
 
-    return {
+    nodes = {
         "baseline_ingestion": baseline_ingestion_node,
         "telemetry_extraction": telemetry_extraction_node,
         "diagnostic_stage1": diagnostic_stage1_node,
@@ -1912,12 +2335,67 @@ def create_operational_nodes(
         "end_rejected": end_rejected_node,
     }
 
+    import os, json, datetime
+    export_dir = os.path.join(os.getcwd(), "exported_logs")
+    os.makedirs(export_dir, exist_ok=True)
+    export_file = os.path.join(export_dir, "node_execution_logs.jsonl")
+
+    def make_logged_node(name, node_fn):
+        def logged_node(state: OperationalState) -> Dict[str, Any]:
+            start_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            result = node_fn(state)
+            end_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            log_entry = {
+                "timestamp": end_time,
+                "node_name": name,
+                "start_time": start_time,
+                "end_time": end_time,
+                "output_state_update": result
+            }
+            try:
+                with open(export_file, "a", encoding="utf-8") as f:
+                    # Filter out non-serializable objects (like execution_logs which might have complex dicts, though they are usually serializable)
+                    # To be safe, we use a custom encoder or just default=str
+                    f.write(json.dumps(log_entry, default=str) + "\n")
+            except Exception as e:
+                print(f"DEBUG EXPORT ERROR in {name}: {e}")
+                logger.error(f"Failed to export node log: {e}")
+            return result
+        return logged_node
+
+    return {name: make_logged_node(name, fn) for name, fn in nodes.items()}
+
 
 # ---------------------------------------------------------------------------
 # Helper functions for IP extraction
 # ---------------------------------------------------------------------------
-def _extract_data_ips(node_data: Dict[str, Any]) -> List[str]:
-    """Extract data-plane IPv4 addresses from node ip_addr text."""
+def _is_mgmt_or_loopback(ip_str: str, mgmt_subnet: Optional[str] = "172.100.100.0/24") -> bool:
+    """Check if an IP address is a loopback or management interface address.
+
+    Preserves RFC 1918 172.16.0.0/12 data plane subnets.
+    """
+    clean = ip_str.split("/")[0]
+    if clean.startswith("127.") or clean == "::1":
+        return True
+    if clean.startswith("172.100.100.") or clean.startswith("172.20.20."):
+        return True
+    if mgmt_subnet:
+        try:
+            net = ipaddress.ip_network(mgmt_subnet, strict=False)
+            addr = ipaddress.ip_address(clean)
+            if addr in net:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _extract_data_ips(node_data: Dict[str, Any], mgmt_subnet: Optional[str] = "172.100.100.0/24") -> List[str]:
+    """Extract data-plane IPv4 addresses from node ip_addr text.
+
+    Preserves RFC 1918 172.16.x.x data addresses, filtering only loopback
+    and actual management subnets.
+    """
     ips: List[str] = []
     ip_text = node_data.get("ip_addr", "")
     if not ip_text or ip_text.startswith("ERROR"):
@@ -1925,7 +2403,7 @@ def _extract_data_ips(node_data: Dict[str, Any]) -> List[str]:
 
     for match in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+)/\d+", ip_text):
         ip = match.group(1)
-        if not ip.startswith("127.") and not ip.startswith("172."):
+        if not _is_mgmt_or_loopback(ip, mgmt_subnet):
             ips.append(ip)
     return ips
 
@@ -1934,8 +2412,9 @@ def _extract_link_ips(
     nodes_data: Dict[str, Dict[str, Any]],
     src: str,
     dst: str,
+    mgmt_subnet: Optional[str] = "172.100.100.0/24",
 ) -> List[str]:
-    """Find IPs of dst on the same subnet as src."""
+    """Find IPs of dst on the same subnet as src, preserving RFC 1918 data subnets."""
     import ipaddress
     src_data = nodes_data.get(src, {})
     dst_data = nodes_data.get(dst, {})
@@ -1944,7 +2423,7 @@ def _extract_link_ips(
     for match in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", src_data.get("ip_addr", "")):
         try:
             iface = ipaddress.IPv4Interface(match.group(1))
-            if not str(iface.ip).startswith("127.") and not str(iface.ip).startswith("172."):
+            if not _is_mgmt_or_loopback(str(iface.ip), mgmt_subnet):
                 src_nets.append(iface.network)
         except ValueError:
             continue
@@ -1953,7 +2432,7 @@ def _extract_link_ips(
     for match in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", dst_data.get("ip_addr", "")):
         try:
             iface = ipaddress.IPv4Interface(match.group(1))
-            if not str(iface.ip).startswith("127.") and not str(iface.ip).startswith("172."):
+            if not _is_mgmt_or_loopback(str(iface.ip), mgmt_subnet):
                 for sn in src_nets:
                     if iface.ip in sn:
                         dst_ips.append(str(iface.ip))

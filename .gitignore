@@ -28,3 +28,6 @@ scenario_results/
 
 # AI Agent internal files
 .agents/
+
+# Generated runtime data (vendor doc scrape cache, SFT samples)
+langgraph_netagent/data/

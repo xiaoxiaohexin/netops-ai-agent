@@ -13,10 +13,31 @@ import shlex
 import sys
 from typing import Any, Dict, List, Optional
 
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+console = Console()
+
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        
+        # Disable QuickEdit Mode to prevent terminal from freezing when user clicks on it
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # STD_INPUT_HANDLE = -10
+        hStdIn = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_uint32()
+        kernel32.GetConsoleMode(hStdIn, ctypes.byref(mode))
+        # ENABLE_QUICK_EDIT_MODE = 0x0040
+        mode.value &= ~0x0040
+        kernel32.SetConsoleMode(hStdIn, mode)
     except Exception:
         pass
 
@@ -148,9 +169,9 @@ class InteractiveNetOpsREPL:
 
         while True:
             try:
-                line = input(f"{C_BOLD}{C_GREEN}NetOps-Agent>{C_RESET} ").strip()
+                line = Prompt.ask("[bold green]NetOps-Agent>[/]").strip()
             except (KeyboardInterrupt, EOFError):
-                print(f"\n{C_DIM}已退出控制台。{C_RESET}")
+                console.print("\n[dim]已退出控制台。[/]")
                 break
 
             if not line:
@@ -253,7 +274,7 @@ class InteractiveNetOpsREPL:
         if prompt_select and sys.stdin.isatty():
             def_choice = self.lab_name or inv.recommended_lab or "1"
             try:
-                choice = input(f"{C_BOLD}{C_YELLOW}请选择要接入的网络拓扑序号或名称 [默认: {def_choice}]: {C_RESET}").strip()
+                choice = Prompt.ask(f"[bold yellow]请选择要接入的网络拓扑序号或名称[/]", default=def_choice).strip()
             except (KeyboardInterrupt, EOFError):
                 choice = ""
             if not choice:
@@ -524,7 +545,7 @@ class InteractiveNetOpsREPL:
         print(f"{C_DIM}输入 'exit' 或 'q' 退出并返回主控制台。{C_RESET}\n")
         while True:
             try:
-                q = input(f"{C_BOLD}{C_CYAN}AI-Chat>{C_RESET} ").strip()
+                q = Prompt.ask("[bold cyan]AI-Chat>[/]").strip()
             except (KeyboardInterrupt, EOFError):
                 print()
                 break

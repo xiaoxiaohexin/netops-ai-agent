@@ -28,18 +28,12 @@ if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         
-        # Disable QuickEdit Mode to prevent terminal from freezing when user clicks on it
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        # STD_INPUT_HANDLE = -10
-        hStdIn = kernel32.GetStdHandle(-10)
-        mode = ctypes.c_uint32()
-        kernel32.GetConsoleMode(hStdIn, ctypes.byref(mode))
-        # ENABLE_QUICK_EDIT_MODE = 0x0040
-        mode.value &= ~0x0040
-        kernel32.SetConsoleMode(hStdIn, mode)
     except Exception:
         pass
+
+from langgraph_netagent import console_guard
+
+console_guard.install()
 
 from langgraph_netagent.llm.base import ChatMessage, LLMConfig
 from langgraph_netagent.llm.providers.mock_provider import MockLLMProvider
@@ -169,7 +163,8 @@ class InteractiveNetOpsREPL:
 
         while True:
             try:
-                line = Prompt.ask("[bold green]NetOps-Agent>[/]").strip()
+                console_guard.restore_console()
+                line = Prompt.ask("[bold green]NetOps-Agent>[/]").lstrip("\ufeff").strip()
             except (KeyboardInterrupt, EOFError):
                 console.print("\n[dim]已退出控制台。[/]")
                 break
@@ -274,6 +269,7 @@ class InteractiveNetOpsREPL:
         if prompt_select and sys.stdin.isatty():
             def_choice = self.lab_name or inv.recommended_lab or "1"
             try:
+                console_guard.restore_console()
                 choice = Prompt.ask(f"[bold yellow]请选择要接入的网络拓扑序号或名称[/]", default=def_choice).strip()
             except (KeyboardInterrupt, EOFError):
                 choice = ""
@@ -545,6 +541,7 @@ class InteractiveNetOpsREPL:
         print(f"{C_DIM}输入 'exit' 或 'q' 退出并返回主控制台。{C_RESET}\n")
         while True:
             try:
+                console_guard.restore_console()
                 q = Prompt.ask("[bold cyan]AI-Chat>[/]").strip()
             except (KeyboardInterrupt, EOFError):
                 print()

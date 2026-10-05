@@ -26,7 +26,7 @@ class TestCLIOptionsAndParser:
         args = parser.parse_args([])
         assert args.mode == "auto"
         assert args.max_retries == 3
-        assert args.auto_approve is True
+        assert args.auto_approve is None
         assert args.topo_only is False
         assert args.provider == "mock"
         assert args.output_dir == "./clab_output"

@@ -739,32 +739,8 @@ def create_day2_nodes(
         "end_rejected": end_rejected_node,
     }
 
-    import os, json, datetime
-    export_dir = os.path.join(os.getcwd(), "exported_logs")
-    os.makedirs(export_dir, exist_ok=True)
-    export_file = os.path.join(export_dir, "node_execution_logs.jsonl")
-
-    def make_logged_node(name, node_fn):
-        def logged_node(state: Day2OpsState) -> Dict[str, Any]:
-            start_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            result = node_fn(state)
-            end_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            log_entry = {
-                "timestamp": end_time,
-                "node_name": name,
-                "start_time": start_time,
-                "end_time": end_time,
-                "output_state_update": result
-            }
-            try:
-                with open(export_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry, default=str) + "\n")
-            except Exception as e:
-                print(f"DEBUG EXPORT ERROR in {name}: {e}")
-            return result
-        return logged_node
-
-    return {name: make_logged_node(name, fn) for name, fn in nodes.items()}
+    from langgraph_netagent.execution_logger import wrap_logged_nodes
+    return wrap_logged_nodes(nodes, module_name="langgraph_netagent.workflow.day2_nodes")
 
 
 # ---------------------------------------------------------------------------

@@ -140,6 +140,13 @@ from langgraph_netagent.workflow import (
     create_harmonized_nodes,
     run_harmonized_workflow,
 )
+from langgraph_netagent.execution_logger import (
+    ExecutionLogEntry,
+    ExecutionLogger,
+    get_execution_logger,
+    log_execution,
+    wrap_logged_nodes,
+)
 
 __all__ = [
     "__version__",
@@ -268,5 +275,11 @@ __all__ = [
     "run_harmonized_workflow",
     "create_harmonized_initial_state",
     "create_harmonized_nodes",
+    # Execution Logger and Audit Tracer
+    "ExecutionLogEntry",
+    "ExecutionLogger",
+    "get_execution_logger",
+    "log_execution",
+    "wrap_logged_nodes",
 ]
 

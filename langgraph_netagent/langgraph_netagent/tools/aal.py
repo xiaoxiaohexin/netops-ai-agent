@@ -201,6 +201,22 @@ class AgentAccessLayer:
             "is_blocked": resp.is_blocked,
             "exit_code": resp.exit_code,
         })
+        try:
+            from langgraph_netagent.execution_logger import get_execution_logger
+            get_execution_logger().log_tool_execution(
+                tool_name=call.tool_name,
+                node_name=call.node_name,
+                command=call.command,
+                read_only=call.read_only,
+                step_tag=call.step_tag,
+                success=resp.success,
+                exit_code=resp.exit_code,
+                is_blocked=resp.is_blocked,
+                output=resp.parsed_json or resp.raw_stdout,
+                error=resp.error_message,
+            )
+        except Exception:
+            pass
 
     @classmethod
     def normalize_cli_output(

@@ -2235,7 +2235,7 @@ def create_operational_nodes(
         """Terminal or loopback node when network is fully healthy."""
         current_cycle = (state.get("watch_cycle") or 0) + 1
         consecutive_healthy = (state.get("consecutive_healthy_cycles") or 0) + 1
-        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        now_ts = datetime.now(timezone.utc).isoformat()
 
         # Temporary state to test routing decision with incremented cycle
         temp_state = dict(state)
@@ -2335,35 +2335,8 @@ def create_operational_nodes(
         "end_rejected": end_rejected_node,
     }
 
-    import os, json, datetime
-    export_dir = os.path.join(os.getcwd(), "exported_logs")
-    os.makedirs(export_dir, exist_ok=True)
-    export_file = os.path.join(export_dir, "node_execution_logs.jsonl")
-
-    def make_logged_node(name, node_fn):
-        def logged_node(state: OperationalState) -> Dict[str, Any]:
-            start_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            result = node_fn(state)
-            end_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            log_entry = {
-                "timestamp": end_time,
-                "node_name": name,
-                "start_time": start_time,
-                "end_time": end_time,
-                "output_state_update": result
-            }
-            try:
-                with open(export_file, "a", encoding="utf-8") as f:
-                    # Filter out non-serializable objects (like execution_logs which might have complex dicts, though they are usually serializable)
-                    # To be safe, we use a custom encoder or just default=str
-                    f.write(json.dumps(log_entry, default=str) + "\n")
-            except Exception as e:
-                print(f"DEBUG EXPORT ERROR in {name}: {e}")
-                logger.error(f"Failed to export node log: {e}")
-            return result
-        return logged_node
-
-    return {name: make_logged_node(name, fn) for name, fn in nodes.items()}
+    from langgraph_netagent.execution_logger import wrap_logged_nodes
+    return wrap_logged_nodes(nodes, module_name="langgraph_netagent.workflow.operational_nodes")
 
 
 # ---------------------------------------------------------------------------

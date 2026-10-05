@@ -395,12 +395,7 @@ Examples:
         default=False,
         help="Generate and validate topology only, skipping deployment and telemetry probing.",
     )
-    parser.add_argument(
-        "--day2",
-        action="store_true",
-        default=False,
-        help="Execute Day-2 Direct Operations Agent against an existing running Containerlab network.",
-    )
+
     parser.add_argument(
         "--harmonized",
         action="store_true",

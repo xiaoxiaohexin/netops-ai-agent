@@ -647,7 +647,7 @@ def create_workflow_nodes(
             "execution_logs": [log],
         }
 
-    return {
+    nodes = {
         "intent_parsing": intent_parsing_node,
         "topology_generation": topology_generation_node,
         "offline_validation": offline_validation_node,
@@ -657,3 +657,5 @@ def create_workflow_nodes(
         "diagnosis_and_healing": diagnosis_and_healing_node,
         "circuit_breaker": circuit_breaker_node,
     }
+    from langgraph_netagent.execution_logger import wrap_logged_nodes
+    return wrap_logged_nodes(nodes, module_name="langgraph_netagent.workflow.nodes")

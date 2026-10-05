@@ -26,7 +26,7 @@ Implement Phases 2-4 of the NetOps Assistant per `ORIGINAL_REQUEST.md`:
    - `tests/test_clab_fault_injector.py`: Tests for fault injection, reversible tokens, and context manager in `clos5`.
    - `tests/test_agentic_reasoning_and_execution.py`: Tests for reasoning engine, repair plan formulation, and deterministic execution with rollback.
    - `tests/test_containerlab_experimental_loop.py`: End-to-end fault injection, detection, self-healing, and programmatic verification loop.
-   - Zero-regression test validation ensuring all 1122+ existing tests remain 100% passing.
+   - Zero-regression test validation ensuring all 1449 existing tests remain 100% passing.
 
 ---
 
@@ -50,7 +50,7 @@ Implement Phases 2-4 of the NetOps Assistant per `ORIGINAL_REQUEST.md`:
 | F15 | NetworkState & StateDiff Test Suite | Tests for Pydantic models, snapshotting, and diff computation | M2, M4 | explorer_survey_4_2 |
 | F16 | Agentic Reasoning & Execution Test Suite | Tests for reasoning engine, repair plan, and deterministic executor with rollback | M3, M4 | explorer_survey_4_3 |
 | F17 | End-to-End Containerlab Experimental Loop Test | Automated test injecting fault, detecting diff, applying deterministic fix, and verifying recovery | M4 | explorer_survey_4_1 |
-| F18 | Full Zero-Regression Suite Validation | Validate 100% pass across all 1122+ existing tests in `langgraph_netagent` | M4 | explorer_survey_4_3 |
+| F18 | Full Zero-Regression Suite Validation | Validate 100% pass across all 1449 existing tests in `langgraph_netagent` | M4 | explorer_survey_4_3 |
 
 ---
 
@@ -60,13 +60,13 @@ Implement Phases 2-4 of the NetOps Assistant per `ORIGINAL_REQUEST.md`:
 | M1 | Containerlab Experimental Loop & Lab Isolation | Implement `clab_fault_injector.py`, `lab_isolation.py`, `experimental_loop.py`, and fault injector tests | none | DONE |
 | M2 | Structured NetworkState Model & State Diff | Implement `models/network_state.py`, `network_state_snapshotter.py`, `state_diff_engine.py`, and state model tests | none | DONE |
 | M3 | Agentic Reasoning & Deterministic Execution Engine | Implement `models/reasoning.py`, `models/repair_plan.py`, `reasoning_engine.py`, `deterministic_executor.py`, `programmatic_verifier.py`, and workflow integration | M1, M2 | DONE |
-| M4 | E2E clos5 Fault Recovery, Verification & Zero Regression | Implement E2E test `test_containerlab_experimental_loop.py`, verify full test suite (1122+ tests), Review, Challenge, and Audit | M1, M2, M3 | DONE |
+| M4 | E2E clos5 Fault Recovery, Verification & Zero Regression | Implement E2E test `test_containerlab_experimental_loop.py`, verify full test suite (1449 tests), Review, Challenge, and Audit | M1, M2, M3 | DONE |
 
 ---
 
 ## Interface Contracts
 
-### Containerlab Fault Injector â†” Experimental Loop
+### Containerlab Fault Injector â†?Experimental Loop
 - **Module**: `langgraph_netagent/tools/clab_fault_injector.py`
 - **Class**: `ContainerlabFaultInjector`
 - **Methods**:
@@ -100,7 +100,7 @@ Implement Phases 2-4 of the NetOps Assistant per `ORIGINAL_REQUEST.md`:
   def compute_state_diff(baseline: NetworkState, current: NetworkState) -> StateDiff: ...
   ```
 
-### Diagnostic Reasoning Engine â†” Deterministic Executor
+### Diagnostic Reasoning Engine â†?Deterministic Executor
 - **Module**: `langgraph_netagent/workflow/reasoning_engine.py`
 - **Class**: `DiagnosticReasoningEngine`
 - **Methods**:

@@ -2,7 +2,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-767%20functions-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1449%20cases-brightgreen.svg)]()
 [![Pydantic v2](https://img.shields.io/badge/Pydantic-v2.7%2B-orange.svg)](https://docs.pydantic.dev/)
 
 > **研究原型（非生产系统）**：闭环自愈网络运维 Agent 的参考实现。默认使用确定性 `mock` 提供器（无真实推理），可选接 Qwen/OpenAI 兼容 LLM；以 **LangGraph 状态机**编排，接入 **Containerlab** 多厂商容器实验网。
@@ -104,7 +104,8 @@ graph TD
         AAL["AgentAccessLayer（正则黑名单 + 只读约束）"]
         Sandbox["ShadowSandboxManager / DockerSandboxRuntime（克隆试跑）"]
         Compiler["CanonicalIntentCompiler（iptables/FRR/Cisco/Huawei 文本 + 回滚）"]
-        SOP["SOPRetriever（硬编码 playbook + 模板树）"]
+        SOP["DynamicSOPRetriever（主用，动态文档爬取）"]
+        LegacySOP["SOPRetriever（已弃用 / 静态回退）"]
     end
 
     subgraph Layer6 [6. 遥测探针]
@@ -211,7 +212,7 @@ Agent 代码库与 Containerlab 实验项目分离：
 
 ## 5. 测试与质量
 
-测试套件包含 **55 个测试文件、767 个 `test_*` 函数**（实际运行 `pytest` 以获取权威数量）：
+测试套件包含 **1449 个自动化测试用例**（实际运行 `pytest` 以获取权威数量）：
 
 ```bash
 # 运行全部测试

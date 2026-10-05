@@ -171,7 +171,7 @@ netagent --mode live --watch --watch-interval 5 --max-watch-cycles 10
 cd langgraph_netagent
 pytest -q
 ```
-*(注：当前实际测试数量为 1123 个，未来请以 CI/CD 自动生成的最新测试报告为准，消除文档中静态硬编码的数据不一致问题)*
+*(注：当前实际测试数量为 1449 个，未来请以 CI/CD 自动生成的最新测试报告为准，消除文档中静态硬编码的数据不一致问题)*
 
 ---
 

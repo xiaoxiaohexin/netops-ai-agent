@@ -99,6 +99,13 @@ class OperationalState(TypedDict):
     scraped_sops: Optional[List[Any]]
     runtime_incident_context: Optional[Dict[str, Any]]
 
+    # 13. Milestone M3 Agentic Reasoning and Deterministic Execution (R3)
+    network_state: Optional[Any]
+    baseline_network_state: Optional[Any]
+    state_diff: Optional[Any]
+    repair_plan: Optional[Any]
+    verification_result: Optional[Any]
+
 
 def create_operational_initial_state(
     max_retries: int = 3,
@@ -195,6 +202,11 @@ def create_operational_initial_state(
         "discovered_topology": None,
         "scraped_sops": [],
         "runtime_incident_context": {},
+        "network_state": None,
+        "baseline_network_state": None,
+        "state_diff": None,
+        "repair_plan": None,
+        "verification_result": None,
     }
 
 
@@ -258,5 +270,12 @@ class OperationalStateModel(BaseModel):
     discovered_topology: Optional[Any] = None
     scraped_sops: List[Any] = Field(default_factory=list)
     runtime_incident_context: Dict[str, Any] = Field(default_factory=dict)
+
+    # Agentic Reasoning and Deterministic Execution (R3)
+    network_state: Optional[Any] = None
+    baseline_network_state: Optional[Any] = None
+    state_diff: Optional[Any] = None
+    repair_plan: Optional[Any] = None
+    verification_result: Optional[Any] = None
 
 

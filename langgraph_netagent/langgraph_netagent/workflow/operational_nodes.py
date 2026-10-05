@@ -50,6 +50,13 @@ from langgraph_netagent.models.remediation import (
     RemediationPlan,
     RollbackStep,
 )
+from langgraph_netagent.models.network_state import NetworkState, StateDiff, compute_state_diff
+from langgraph_netagent.models.reasoning import DiagnosticStrategy, DiagnosticStrategySelector
+from langgraph_netagent.models.repair_plan import RepairAction, RepairPlan
+from langgraph_netagent.tools.network_state_snapshotter import NetworkStateSnapshotter
+from langgraph_netagent.tools.deterministic_executor import DeterministicExecutor
+from langgraph_netagent.workflow.reasoning_engine import DiagnosticReasoningEngine
+from langgraph_netagent.workflow.programmatic_verifier import ProgrammaticVerifier, VerificationResult
 from langgraph_netagent.models.discovered_topology import (
     DiscoveredInterface,
     DiscoveredLink,
@@ -1177,6 +1184,56 @@ def create_operational_nodes(
 
         rag_keywords = sorted([k for k in keywords_set if k])
 
+        # 3. M3 Structured NetworkState Snapshot & StateDiff Computation
+        computed_diff = None
+        curr_network_state = None
+        base_network_state = state.get("baseline_network_state")
+
+        try:
+            snapshotter = NetworkStateSnapshotter(
+                lab_adapter=lab_adapter,
+                topology=state.get("discovered_topology"),
+                lab_name=lab_name or "clos5",
+            )
+            # Check if state_diff was already passed in state
+            existing_diff = state.get("state_diff")
+            if existing_diff:
+                if isinstance(existing_diff, StateDiff):
+                    computed_diff = existing_diff
+                elif isinstance(existing_diff, dict):
+                    computed_diff = StateDiff(**existing_diff)
+
+            if computed_diff is None:
+                curr_network_state = snapshotter.capture_snapshot(target_nodes=suspects or None)
+                if base_network_state:
+                    if isinstance(base_network_state, dict):
+                        base_ns_obj = NetworkState(**base_network_state)
+                    else:
+                        base_ns_obj = base_network_state
+                else:
+                    # Use current state as healthy baseline reference
+                    base_ns_obj = snapshotter.capture_snapshot(target_nodes=suspects or None)
+                    base_ns_obj.healthy = True
+                    for disc in discrepancies:
+                        d_node = disc.get("node")
+                        d_iface = disc.get("affected_interface") or disc.get("interface")
+                        if d_node and d_iface and d_node in base_ns_obj.nodes:
+                            if d_iface in base_ns_obj.nodes[d_node].interfaces:
+                                base_ns_obj.nodes[d_node].interfaces[d_iface].oper_state = "UP"
+                                base_ns_obj.nodes[d_node].interfaces[d_iface].admin_state = "UP"
+                    base_network_state = base_ns_obj.model_dump()
+
+                computed_diff = compute_state_diff(baseline=base_ns_obj, current=curr_network_state)
+        except Exception as exc:
+            logger.debug("Failed computing state_diff in stage 1: %s", exc)
+
+        if computed_diff is not None:
+            enriched_context["state_diff"] = computed_diff.model_dump()
+            enriched_context["state_diff_markdown"] = computed_diff.to_llm_markdown()
+            for aff_node in computed_diff.affected_nodes():
+                if aff_node not in suspects:
+                    suspects.append(aff_node)
+
         log = create_log_entry(
             stage="diagnostic_stage1",
             message=f"Stage 1 Enrichment complete: enriched {len(suspects)} suspect nodes, inferred {len(rag_keywords)} RAG keywords",
@@ -1187,6 +1244,10 @@ def create_operational_nodes(
         return {
             "enriched_context": enriched_context,
             "rag_keywords": rag_keywords,
+            "suspect_devices": suspects,
+            "network_state": curr_network_state.model_dump() if hasattr(curr_network_state, "model_dump") else (curr_network_state or state.get("network_state")),
+            "baseline_network_state": base_network_state or state.get("baseline_network_state"),
+            "state_diff": computed_diff.model_dump() if hasattr(computed_diff, "model_dump") else (computed_diff or state.get("state_diff")),
             "autonomy_tier": "full_autonomy",
             "step_tag": state.get("step_tag", ""),
             "status": "stage1_enriched",
@@ -1528,14 +1589,14 @@ def create_operational_nodes(
             target_node = None
             discrepant_routers = [
                 disc.get("node") for disc in discrepancies
-                if disc.get("node") and state.get("node_kinds", {}).get(disc.get("node")) in ("frr", "srl", "router")
+                if disc.get("node") and (state.get("node_kinds") or {}).get(disc.get("node")) in ("frr", "srl", "router")
             ]
             if discrepant_routers:
                 target_node = discrepant_routers[retry_count % len(discrepant_routers)]
 
             if not target_node:
                 for s in suspects:
-                    if state.get("node_kinds", {}).get(s) in ("frr", "srl", "router"):
+                    if (state.get("node_kinds") or {}).get(s) in ("frr", "srl", "router"):
                         target_node = s
                         break
 
@@ -1553,7 +1614,7 @@ def create_operational_nodes(
                 else:
                     target_node = "router"
 
-            target_kind = state.get("node_kinds", {}).get(target_node, "frr")
+            target_kind = (state.get("node_kinds") or {}).get(target_node, "frr")
             target_disc = next((d for d in discrepancies if d.get("node") == target_node), {})
 
             canonical_intents = []
@@ -1750,6 +1811,33 @@ def create_operational_nodes(
                         estimated_risk=SeverityLevel.LOW,
                     )
 
+        # M3: DiagnosticReasoningEngine and RepairPlan formulation
+        repair_plan_obj: Optional[RepairPlan] = None
+        state_diff_val = state.get("state_diff")
+        if state_diff_val:
+            try:
+                diff_instance = StateDiff(**state_diff_val) if isinstance(state_diff_val, dict) else (state_diff_val if isinstance(state_diff_val, StateDiff) else None)
+                if diff_instance and diff_instance.has_anomalies():
+                    engine = DiagnosticReasoningEngine(llm_provider=llm_provider)
+                    repair_plan_obj = engine.analyze_diff_and_plan(
+                        state_diff=diff_instance,
+                        topology=discovered_topo_obj,
+                        sops=retrieved_sop,
+                        step_tag=current_step_tag,
+                    )
+            except Exception as e:
+                logger.debug("Error formulating repair_plan with DiagnosticReasoningEngine: %s", e)
+
+        # Ensure bidirectional sync between remed_plan and repair_plan_obj
+        if repair_plan_obj is not None and repair_plan_obj.actions:
+            if remed_plan is None or not remed_plan.exec_commands or repair_plan_obj.strategy == DiagnosticStrategy.LINK_RECOVERY:
+                remed_plan = repair_plan_obj.to_legacy_remediation_plan()
+        elif repair_plan_obj is None and remed_plan is not None:
+            repair_plan_obj = RepairPlan.from_legacy_remediation_plan(
+                remed_plan,
+                incident_id=state.get("incident_id") or f"inc-{current_step_tag}",
+            )
+
         # 4. Explicitly attach iteration counter tags (`step_tag`) to each command
         history = list(state.get("step_tags_history") or [])
         history.append(current_step_tag)
@@ -1767,6 +1855,7 @@ def create_operational_nodes(
         return {
             "diagnostic_report": diag_report.model_dump(),
             "remediation_plan": plan_dict,
+            "repair_plan": repair_plan_obj.model_dump() if repair_plan_obj else None,
             "retrieved_sop": retrieved_sop,
             "dual_retrieval_results": dual_retrieval_results,
             "canonical_intents": [ci.model_dump() for ci in canonical_intents],
@@ -2005,37 +2094,78 @@ def create_operational_nodes(
     # Node 7: Live Hot-Patching via AAL
     # -----------------------------------------------------------------------
     def live_hot_patch_node(state: OperationalState) -> Dict[str, Any]:
-        """Apply hot-patch to target nodes via AAL with iteration step_tags."""
+        """Apply hot-patch to target nodes via AAL with iteration step_tags and DeterministicExecutor."""
         remed = state.get("remediation_plan") or {}
         target = remed.get("target_entity", "")
         exec_cmds = remed.get("exec_commands", [])
         step_tag = state.get("current_step_tag") or "live_patch"
 
+        # M3: DeterministicExecutor with transactional pre/post check assertions and LIFO rollback
+        repair_plan_raw = state.get("repair_plan")
+        plan_to_run: Optional[RepairPlan] = None
+        if repair_plan_raw:
+            if isinstance(repair_plan_raw, dict):
+                try:
+                    plan_to_run = RepairPlan(**repair_plan_raw)
+                except Exception:
+                    plan_to_run = None
+            elif isinstance(repair_plan_raw, RepairPlan):
+                plan_to_run = repair_plan_raw
+
+        if plan_to_run is None and remed and exec_cmds:
+            try:
+                legacy_remed = RemediationPlan(**remed)
+                plan_to_run = RepairPlan.from_legacy_remediation_plan(legacy_remed)
+            except Exception:
+                plan_to_run = None
+
         results: List[Dict[str, Any]] = []
         all_ok = True
 
-        for idx, cmd in enumerate(exec_cmds, start=1):
-            cmd_tag = f"{step_tag}_live_{idx}"
-            tool_call = AALToolCall(
-                tool_name="patch_exec",
-                node_name=target,
-                command=cmd,
-                step_tag=cmd_tag,
-                read_only=False,
-                timeout=15,
+        if plan_to_run and plan_to_run.actions:
+            executor = DeterministicExecutor(
+                agent_access_layer=agent_access_layer,
+                lab_adapter=lab_adapter,
+                lab_name=lab_name or "clos5",
             )
-            aal_resp = agent_access_layer.execute(tool_call)
-            results.append({
-                "command": cmd,
-                "step_tag": cmd_tag,
-                "exit_code": aal_resp.exit_code,
-                "stdout": aal_resp.raw_stdout[:500],
-                "stderr": aal_resp.raw_stderr[:500],
-                "parsed_json": aal_resp.parsed_json,
-                "success": aal_resp.success,
-            })
-            if not aal_resp.success:
-                all_ok = False
+            exec_res = executor.execute_plan(plan_to_run, step_tag=step_tag)
+            all_ok = exec_res.success
+            target = plan_to_run.target_node or target
+            results = exec_res.action_outputs or []
+            if not results:
+                for act in exec_res.executed_actions:
+                    results.append({
+                        "command": act.command,
+                        "step_tag": step_tag,
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "parsed_json": {},
+                        "success": True,
+                    })
+        else:
+            for idx, cmd in enumerate(exec_cmds, start=1):
+                cmd_tag = f"{step_tag}_live_{idx}"
+                tool_call = AALToolCall(
+                    tool_name="patch_exec",
+                    node_name=target,
+                    command=cmd,
+                    step_tag=cmd_tag,
+                    read_only=False,
+                    timeout=15,
+                )
+                aal_resp = agent_access_layer.execute(tool_call)
+                results.append({
+                    "command": cmd,
+                    "step_tag": cmd_tag,
+                    "exit_code": aal_resp.exit_code,
+                    "stdout": aal_resp.raw_stdout[:500],
+                    "stderr": aal_resp.raw_stderr[:500],
+                    "parsed_json": aal_resp.parsed_json,
+                    "success": aal_resp.success,
+                })
+                if not aal_resp.success:
+                    all_ok = False
 
         log = create_log_entry(
             stage="live_hot_patch",
@@ -2128,6 +2258,24 @@ def create_operational_nodes(
             report_dict = {"all_passed": False, "failures": [str(exc)]}
             is_fixed = False
 
+        # M3: ProgrammaticVerifier integration
+        verification_result_dict = None
+        base_ns_raw = state.get("baseline_network_state")
+        diff_raw = state.get("state_diff")
+        if base_ns_raw:
+            try:
+                base_ns_obj = NetworkState(**base_ns_raw) if isinstance(base_ns_raw, dict) else base_ns_raw
+                diff_obj = StateDiff(**diff_raw) if isinstance(diff_raw, dict) else (diff_raw if isinstance(diff_raw, StateDiff) else None)
+                snapshotter = NetworkStateSnapshotter(lab_adapter=lab_adapter, lab_name=lab_name or "clos5")
+                post_repair_ns = snapshotter.capture_snapshot()
+                verifier = ProgrammaticVerifier(lab_adapter=lab_adapter)
+                v_res = verifier.verify_repair(baseline=base_ns_obj, post_repair=post_repair_ns, target_fault_diff=diff_obj)
+                verification_result_dict = v_res.model_dump()
+                if v_res.passed:
+                    is_fixed = True
+            except Exception as e:
+                logger.debug("ProgrammaticVerifier evaluation error: %s", e)
+
         if is_fixed:
             # Snapshot post-patch qdisc stats so subsequent watch cycles treat this as the new baseline
             updated_qstats = {}
@@ -2147,6 +2295,7 @@ def create_operational_nodes(
             )
             return {
                 "re_verify_results": report_dict,
+                "verification_result": verification_result_dict,
                 "last_qdisc_stats": updated_qstats or state.get("last_qdisc_stats"),
                 "autonomy_tier": "bounded",
                 "status": "re_verified",
@@ -2199,6 +2348,7 @@ def create_operational_nodes(
             )
             return {
                 "re_verify_results": report_dict,
+                "verification_result": verification_result_dict,
                 "rollback_executed": True if rollback_results else False,
                 "rollback_results": rollback_results,
                 "retry_count": new_retries,

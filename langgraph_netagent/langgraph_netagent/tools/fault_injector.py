@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from enum import Enum
+import re
 import uuid
 from typing import Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
@@ -280,6 +281,53 @@ class FaultInjector:
                             matched = True
 
                         if matched:
+                            cleared.append(rule)
+                            del self._rules[rule_id]
+
+            # Check for link up
+            if "ip link set" in cmd_clean and "up" in cmd_clean:
+                m_dev = re.search(r"(?:dev\s+)?([a-zA-Z0-9_\-\.]+)\s+up", cmd_clean, re.IGNORECASE)
+                dev_name = m_dev.group(1) if m_dev else None
+                for rule_id, rule in list(self._rules.items()):
+                    if not rule.cleared_on_remediation:
+                        continue
+                    if rule.fault_type == FaultType.INTERFACE_DOWN:
+                        if rule.target_node and node and rule.target_node != node:
+                            continue
+                        if not rule.target_interface or not dev_name or rule.target_interface == dev_name:
+                            cleared.append(rule)
+                            del self._rules[rule_id]
+
+            # Check for tc qdisc del
+            if "tc qdisc del" in cmd_clean:
+                m_dev = re.search(r"dev\s+([a-zA-Z0-9_\-\.]+)", cmd_clean, re.IGNORECASE)
+                dev_name = m_dev.group(1) if m_dev else None
+                for rule_id, rule in list(self._rules.items()):
+                    if not rule.cleared_on_remediation:
+                        continue
+                    if rule.fault_type in (FaultType.INTERMITTENT_LOSS, FaultType.BUFFER_OVERLIMIT, FaultType.TRAFFIC_OVERLOAD):
+                        if rule.target_node and node and rule.target_node != node:
+                            continue
+                        if not rule.target_interface or not dev_name or rule.target_interface == dev_name:
+                            cleared.append(rule)
+                            del self._rules[rule_id]
+
+            # Check for ip route add / replace
+            if "ip route" in cmd_clean and ("replace" in cmd_clean or "add" in cmd_clean) and "del" not in cmd_clean:
+                m_pfx = re.search(r"ip\s+route\s+(?:replace|add)\s+([0-9\./]+|default)", cmd_clean, re.IGNORECASE)
+                target_pfx = m_pfx.group(1) if m_pfx else None
+                for rule_id, rule in list(self._rules.items()):
+                    if not rule.cleared_on_remediation:
+                        continue
+                    if rule.fault_type == FaultType.MISSING_ROUTE:
+                        if rule.target_node and node and rule.target_node != node:
+                            continue
+                        if (
+                            not rule.target_ip_or_prefix
+                            or not target_pfx
+                            or rule.target_ip_or_prefix == target_pfx
+                            or (target_pfx == "default" and rule.target_ip_or_prefix in ("default", "0.0.0.0/0"))
+                        ):
                             cleared.append(rule)
                             del self._rules[rule_id]
 

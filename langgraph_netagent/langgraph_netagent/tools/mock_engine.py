@@ -752,6 +752,11 @@ class MockEngine:
         req_dev = m_dev.group(1) if m_dev else None
 
         rule = self.fault_injector.get_buffer_overlimit(node=node_name, interface=req_dev)
+        loss_rule = None
+        for r in self.fault_injector.get_active_rules():
+            if r.fault_type == FaultType.INTERMITTENT_LOSS and r.target_node == node_name and (not req_dev or not r.target_interface or r.target_interface == req_dev):
+                loss_rule = r
+                break
 
         lines: List[str] = []
         if req_dev:
@@ -770,6 +775,11 @@ class MockEngine:
                 lines.append(f" backlog 0b 0p requeues 0")
                 lines.append(f"qdisc tbf 10: dev {iface_name} parent 1: rate 50Mbit burst 2Kb lat 4.9ms")
                 lines.append(f" Sent 426714991 bytes 4281816 pkt (dropped {dropped}, overlimits {overlimits} requeues 0)")
+                lines.append(f" backlog 0b 0p requeues 0")
+            elif loss_rule and (not loss_rule.target_interface or loss_rule.target_interface == iface_name):
+                loss_val = loss_rule.loss_pct
+                lines.append(f"qdisc netem 1: dev {iface_name} root refcnt 17 limit 1000 loss {loss_val:g}%")
+                lines.append(f" Sent 426714991 bytes 4281816 pkt (dropped 0, overlimits 0 requeues 0)")
                 lines.append(f" backlog 0b 0p requeues 0")
             else:
                 lines.append(f"qdisc fq_codel 0: dev {iface_name} root refcnt 2 limit 10240p flows 1024 quantum 1514")

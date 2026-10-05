@@ -239,6 +239,18 @@ class DiagnosticReasoningEngine:
             for node, qdiff in state_diff.qdisc_diffs.items():
                 for iface, changes in qdiff.changed.items():
                     target_nodes.append(node)
+                    # Extract previous state parameters from diff if available
+                    loss_percent = changes.get("loss_percent", (0, 30))[1] if isinstance(changes, dict) else 30
+                    delay_ms = changes.get("delay_ms", (0, 0))[1] if isinstance(changes, dict) else 0
+                    
+                    rollback_opts = []
+                    if loss_percent > 0:
+                        rollback_opts.append(f"loss {loss_percent}%")
+                    if delay_ms > 0:
+                        rollback_opts.append(f"delay {delay_ms}ms")
+                    
+                    rollback_str = " ".join(rollback_opts) if rollback_opts else "loss 30%"
+                    
                     actions.append(
                         RepairAction(
                             action_id=f"act-qdisc-{node}-{iface}",
@@ -250,7 +262,7 @@ class DiagnosticReasoningEngine:
                             expected_pre_condition="netem",
                             post_check_command=f"tc qdisc show dev {iface}",
                             expected_post_condition=None,
-                            rollback_command=f"tc qdisc add dev {iface} root netem loss 30%",
+                            rollback_command=f"tc qdisc add dev {iface} root netem {rollback_str}",
                             description=f"Reset qdisc netem on {node}:{iface}",
                         )
                     )
@@ -317,17 +329,8 @@ class DiagnosticReasoningEngine:
         if not actions and state_diff.affected_nodes():
             first_node = state_diff.affected_nodes()[0]
             target_nodes.append(first_node)
-            actions.append(
-                RepairAction(
-                    action_id=f"act-default-{first_node}",
-                    order=1,
-                    target_node=first_node,
-                    action_type="link_up",
-                    command="ip link set dev eth1 up",
-                    rollback_command="ip link set dev eth1 down",
-                    description=f"Default recovery attempt on {first_node}",
-                )
-            )
+            justification = f"Unknown fault on {first_node}, unable to determine deterministic remediation. Deferring to human review."
+            requires_approval = True
 
         primary_target = target_nodes[0] if target_nodes else (state_diff.affected_nodes()[0] if state_diff.affected_nodes() else "network")
 

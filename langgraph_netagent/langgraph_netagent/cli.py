@@ -368,8 +368,8 @@ Examples:
     parser.add_argument(
         "--auto-approve",
         action="store_true",
-        default=True,
-        help="Automatically approve deployment at human approval checkpoint (default: True).",
+        default=None,
+        help="Automatically approve deployment at human approval checkpoint (default: True in LAB/live mode, False otherwise).",
     )
     parser.add_argument(
         "--no-auto-approve",
@@ -526,6 +526,9 @@ def run_cli(args: Optional[Sequence[str]] = None) -> int:
 
     if resolved_mode == "auto":
         resolved_mode = "live" if capabilities.resolved_mode == ExecutionMode.LIVE else "mock"
+
+    if parsed_args.auto_approve is None:
+        parsed_args.auto_approve = (resolved_mode == "live" or resolved_mode == "mock")
 
     print(f"[{cyan}MODE{reset}]     Requested: {parsed_args.mode.upper()} | Resolved: {resolved_mode.upper()} ({capabilities.reason})")
     print(f"[{cyan}INTENT{reset}]   {parsed_args.intent}")

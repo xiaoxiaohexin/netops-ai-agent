@@ -1,4 +1,4 @@
-# LangGraph NetOps Agent（`langgraph_netagent`）
+﻿# LangGraph NetOps Agent（`langgraph_netagent`）
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -229,6 +229,6 @@ python -c "import compileall; compileall.compile_dir('langgraph_netagent', force
 - 遥测探针 / 状态机 / 图编译
 - 离线校验 / 故障注入
 - 工作流 happy-path / 校验环 / 自愈环 / 熔断 / HITL
-- AAL / 沙箱 / 意图编译 / 厂商知识 / 两阶段诊断 / 持续监控 / 对抗测试
+- AAL / 隔离拦截 / 意图编译 / 厂商知识 / 两阶段诊断 / 持续监控 / 对抗测试
 
 > 说明：微调样例数据位于 `langgraph_netagent/data/`（`sft_samples.jsonl`、`sft_agent_workflow.jsonl`），生成脚本为 `generate_agent_sft.py`，可用于 Qwen2.5 系列微调实验；此前文档中「100% 无幻觉」等表述为过度表述，已移除。

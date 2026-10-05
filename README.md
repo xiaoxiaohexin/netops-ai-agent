@@ -1,4 +1,4 @@
-# NetOps AI Agent
+﻿# NetOps AI Agent
 
 > **项目定位**：**面向实验环境与小型局域网的网络运维智能助手（NetOps Assistant）**。
 > 本项目主要作为研究与教学原型，在 Containerlab 等实验环境下演示网络感知、异常检测、故障诊断与有限场景自愈的闭环运维能力。
@@ -165,7 +165,7 @@ netagent --mode live --watch --watch-interval 5 --max-watch-cycles 10
 
 ## 测试覆盖
 
-测试覆盖模型、探针、工作流、AAL、沙箱、意图编译等模块：
+测试覆盖模型、探针、工作流、AAL、隔离拦截、意图编译等模块：
 
 ```bash
 cd langgraph_netagent
